@@ -13,9 +13,16 @@ import (
 	"weave-os/router/internal/router/catalog"
 	"weave-os/router/internal/subscriptions/entitlement"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// SubscriptionErrorCode identifies a subscription admission refusal.
+type SubscriptionErrorCode string
+
+// SubscriptionPlanConflict means linked funding cannot satisfy the plan's model boundary.
+const SubscriptionPlanConflict SubscriptionErrorCode = "subscription_plan_conflict"
 
 // WithSubscriberAllowance gates inference on an individual Max/Boost
 // subscriber's included Router allowance. Attached after WithAuth so the
@@ -25,25 +32,30 @@ import (
 // organization billing, BYOK, and prepaid keys keep the gates they already had,
 // and this middleware is the only place the included allowance is enforced.
 //
-// An exhausted window answers 402 rather than silently routing onto paid
-// capacity — the subscriber bought a bounded allowance, and quietly spending
-// their org's balance instead is the surprise this gate exists to prevent. An
-// allowance read error fails closed with 503, mirroring WithBalanceCheck: an
-// allowance that admits everything while unreadable is an unbilled-usage hole.
+// Linked Claude/Codex subscriptions cannot satisfy Max's open-source boundary;
+// those requests are refused without switching to metered capacity. Other
+// callers prefer compatible linked-provider capacity. When linked and included capacity
+// are unavailable, requests continue through the existing organization balance
+// and spend-limit gates. Allowance read errors fail closed because treating an
+// unreadable meter as exhausted would incorrectly authorize organization
+// spending.
 func WithSubscriberAllowance(svc *entitlement.Service) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		log := observability.FromGin(c)
-		apiKey := APIKeyFrom(c)
-		if apiKey == nil || apiKey.CredentialSubjectID == "" {
+		// The allowance follows the person the request identified itself as,
+		// not the key it authenticated with: a key shared across an
+		// organization must spend each caller's own included capacity.
+		owner := SubscriptionOwnerFrom(c)
+		if owner.SubscriberID == "" {
 			c.Next()
 			return
 		}
 
-		subscriberID := entitlement.SubscriberID(apiKey.CredentialSubjectID)
+		subscriberID := entitlement.SubscriberID(owner.SubscriberID)
 
 		admission, err := svc.Admit(c.Request.Context(), subscriberID)
 		if err != nil {
-			log.Error("Subscriber allowance check failed; refusing request", "err", err, "subscriber_id", apiKey.CredentialSubjectID)
+			log.Error("Subscriber allowance check failed; refusing request", "err", err, "subscriber_id", subscriberID)
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 				"error":   "billing_unavailable",
 				"message": "Billing system is temporarily unavailable. Retry in a few moments.",
@@ -53,7 +65,7 @@ func WithSubscriberAllowance(svc *entitlement.Service) gin.HandlerFunc {
 
 		// The plan's hard model boundary is stamped before the allowance
 		// verdict is acted on, so it governs the turn no matter which book
-		// ends up paying for it — included allowance, prepaid, or the caller's
+		// ends up paying for it — included allowance, organization credits, or the caller's
 		// own covering subscription.
 		if admission.Plan != "" {
 			c.Request = c.Request.WithContext(entitlement.WithProductScope(c.Request.Context(), admission.Plan))
@@ -67,36 +79,28 @@ func WithSubscriberAllowance(svc *entitlement.Service) gin.HandlerFunc {
 			return
 		}
 
-		switch admission.Outcome {
-		case entitlement.AdmissionNotSubscribed:
-			c.Next()
-		case entitlement.AdmissionExhausted:
-			// A request presenting a Claude/Codex credential covering this route
-			// can serve at $0 on the caller's own plan without drawing included
-			// Router capacity, so a spent allowance must not refuse it. Settlement
-			// stays honest either way: it accounts only included_router capacity,
-			// and this request carries no coverage to settle against.
-			if serveOnCoveringSubscription(c) {
+		// A linked-funding conflict must not silently reserve included allowance
+		// or spend organization credits instead.
+		if proxy.RequestPresentsCoveringSubscription(c.Request.Context(), c.Request.Header, c.FullPath()) {
+			if admission.Plan == entitlement.PlanMax {
+				log.Warn("Linked subscription rejected by plan model boundary", "subscriber_id", subscriberID, "subscriber_plan", admission.Plan)
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error":   SubscriptionPlanConflict,
+					"message": "Your Weave Max plan only supports open-source models. Linked Claude and Codex subscriptions cannot serve this request. Disable linked-subscription routing or choose a compatible plan before retrying. No included allowance or prepaid credits were used.",
+				})
 				return
 			}
-			window := exhaustedWindow(admission)
-			log.Info("Request rejected: subscriber allowance exhausted",
-				"subscriber_id", apiKey.CredentialSubjectID,
-				"period_kind", admission.ExhaustedPeriod,
-				"consumed_usd_micros", window.ConsumedUsdMicros(),
-				"allowance_usd_micros", window.LimitUsdMicros,
-			)
-			c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{
-				"error":                "subscription_allowance_exhausted",
-				"period_kind":          string(admission.ExhaustedPeriod),
-				"period_end":           window.Period.End,
-				"consumed_usd_micros":  window.ConsumedUsdMicros(),
-				"allowance_usd_micros": window.LimitUsdMicros,
-				"message":              allowanceExhaustedMessage(admission.ExhaustedPeriod),
-			})
-		case entitlement.AdmissionCovered:
-			holdRequest(c, log, svc, admission)
+			c.Request = c.Request.WithContext(billing.WithSubscriptionOnly(c.Request.Context(), billing.SubscriptionOnlyLinkedFirst))
+			c.Next()
+			return
 		}
+
+		if admission.Outcome == entitlement.AdmissionNotSubscribed ||
+			(admission.Outcome == entitlement.AdmissionExhausted && !admission.HeldCapacityOnly()) {
+			c.Next()
+			return
+		}
+		holdRequest(c, log, svc, subscriberID, admission)
 	}
 }
 
@@ -109,7 +113,7 @@ func WithSubscriberAllowance(svc *entitlement.Service) gin.HandlerFunc {
 // consumed + reserved within the limit. Settlement books the turn's actual
 // cost under its own action identifiers, so releasing the hold afterwards
 // neither refunds nor double-charges the served work.
-func holdRequest(c *gin.Context, log *slog.Logger, svc *entitlement.Service, admission entitlement.Admission) {
+func holdRequest(c *gin.Context, log *slog.Logger, svc *entitlement.Service, subscriberID entitlement.SubscriberID, admission entitlement.Admission) {
 	ctx := c.Request.Context()
 	requestID := observability.RequestIDFromContext(ctx)
 	if requestID == "" {
@@ -118,35 +122,82 @@ func holdRequest(c *gin.Context, log *slog.Logger, svc *entitlement.Service, adm
 		requestID = uuid.NewString()
 	}
 
-	hold := entitlement.Hold{
-		Coverage:            admission.Coverage,
-		ActionID:            requestID + holdActionSuffix,
-		RouterRequestID:     requestID,
-		APIKeyID:            APIKeyFrom(c).ID,
-		RequestedModel:      entitlement.ModelUnresolved,
-		UpperBoundUsdMicros: holdUsdMicros(admission.Usage),
-		CapacitySource:      entitlement.CapacitySourceIncludedRouter,
-	}
-
-	if _, err := svc.Reserve(ctx, hold); errors.Is(err, entitlement.ErrAllowanceExhausted) {
-		var exhausted entitlement.ExhaustedError
-		errors.As(err, &exhausted)
-		refuseExhausted(c, log, admission, exhausted.Period)
+	retryPolicy := backoff.NewExponentialBackOff()
+	retryPolicy.InitialInterval = 40 * time.Millisecond
+	retryPolicy.MaxInterval = 250 * time.Millisecond
+	firstAttempt := true
+	hold, err := backoff.Retry(ctx, func() (entitlement.Hold, error) {
+		if !firstAttempt {
+			var readErr error
+			admission, readErr = svc.Admit(ctx, subscriberID)
+			if readErr != nil {
+				return entitlement.Hold{}, backoff.Permanent(readErr)
+			}
+		}
+		firstAttempt = false
+		if admission.Outcome == entitlement.AdmissionNotSubscribed ||
+			(admission.Outcome == entitlement.AdmissionExhausted && !admission.HeldCapacityOnly()) {
+			return entitlement.Hold{}, nil
+		}
+		if admission.Outcome == entitlement.AdmissionExhausted {
+			return entitlement.Hold{}, entitlement.ErrAllowanceExhausted
+		}
+		hold := entitlement.Hold{
+			Coverage:            admission.Coverage,
+			ActionID:            requestID + holdActionSuffix,
+			RouterRequestID:     requestID,
+			APIKeyID:            APIKeyFrom(c).ID,
+			RequestedModel:      entitlement.ModelUnresolved,
+			UpperBoundUsdMicros: holdUsdMicros(admission.Usage),
+			CapacitySource:      entitlement.CapacitySourceIncludedRouter,
+		}
+		if _, reserveErr := svc.Reserve(ctx, hold); reserveErr != nil {
+			if errors.Is(reserveErr, entitlement.ErrAllowanceExhausted) {
+				return entitlement.Hold{}, reserveErr
+			}
+			return entitlement.Hold{}, backoff.Permanent(reserveErr)
+		}
+		return hold, nil
+	}, backoff.WithBackOff(retryPolicy), backoff.WithMaxElapsedTime(2*time.Second))
+	if errors.Is(err, entitlement.ErrAllowanceExhausted) {
+		log.Warn("Subscriber allowance temporarily held by concurrent turns", "subscriber_id", subscriberID, "period", admission.ExhaustedPeriod)
+		c.Header("Retry-After", "1")
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "subscription_capacity_busy",
+			"message": "Subscription capacity is temporarily reserved by another request. Retry shortly.",
+		})
 		return
-	} else if err != nil {
-		log.Error("Subscriber allowance reservation failed; refusing request", "err", err, "subscriber_id", string(admission.Coverage.SubscriberID))
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			c.Abort()
+			return
+		}
+		log.Error("Subscriber allowance reservation failed; refusing request", "err", err, "subscriber_id", subscriberID)
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 			"error":   "billing_unavailable",
 			"message": "Billing system is temporarily unavailable. Retry in a few moments.",
 		})
 		return
 	}
+	if admission.Plan != "" {
+		c.Request = c.Request.WithContext(entitlement.WithProductScope(c.Request.Context(), admission.Plan))
+	}
+	if hold.ActionID == "" {
+		c.Next()
+		return
+	}
 
 	// Coverage is stamped only once the hold is confirmed: a refused request
 	// must not reach settlement as allowance-covered.
-	c.Request = c.Request.WithContext(entitlement.WithCoverage(ctx, admission.Coverage))
+	hold.Coverage.ProjectedUsdMicros = hold.UpperBoundUsdMicros
+	c.Request = c.Request.WithContext(entitlement.WithCoverage(c.Request.Context(), hold.Coverage))
 
 	c.Next()
+	if entitlement.SettlementFailed(c.Request.Context()) {
+		log.Error("Subscriber allowance hold left standing after settlement failure", "action_id", hold.ActionID)
+		return
+	}
 
 	// The release outlives the request: a client that disconnects mid-turn
 	// cancels ctx, and releasing under it would leave the bound held for the
@@ -175,7 +226,7 @@ const releaseHoldTimeout = 5 * time.Second
 // smaller than one worst-case turn could never dispatch at all.
 func holdUsdMicros(usage entitlement.Usage) int64 {
 	bound := catalog.TurnUpperBoundUsdMicros()
-	for _, window := range []entitlement.WindowUsage{usage.SixHour, usage.Billing} {
+	for _, window := range []entitlement.WindowUsage{usage.SixHour, usage.Weekly, usage.Billing} {
 		headroom := window.LimitUsdMicros - window.ConsumedUsdMicros()
 		if headroom > 0 && headroom < bound {
 			bound = headroom
@@ -184,63 +235,11 @@ func holdUsdMicros(usage entitlement.Usage) int64 {
 	return bound
 }
 
-// refuseExhausted answers a spent window, unless the caller's own linked
-// subscription can serve the route at no cost to the included allowance.
-func refuseExhausted(c *gin.Context, log *slog.Logger, admission entitlement.Admission, period entitlement.PeriodKind) {
-	if serveOnCoveringSubscription(c) {
-		return
-	}
-	admission.ExhaustedPeriod = period
-	window := exhaustedWindow(admission)
-	log.Info("Request rejected: subscriber allowance exhausted",
-		"subscriber_id", string(admission.Coverage.SubscriberID),
-		"period_kind", period,
-		"consumed_usd_micros", window.ConsumedUsdMicros(),
-		"allowance_usd_micros", window.LimitUsdMicros,
-	)
-	c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{
-		"error":                "subscription_allowance_exhausted",
-		"period_kind":          string(period),
-		"period_end":           window.Period.End,
-		"consumed_usd_micros":  window.ConsumedUsdMicros(),
-		"allowance_usd_micros": window.LimitUsdMicros,
-		"message":              allowanceExhaustedMessage(period),
-	})
-}
-
-// serveOnCoveringSubscription serves a turn the caller's own linked plan
-// covers, and reports whether it did. The turn is marked subscription-only, as
-// the balance and spend-cap gates mark theirs: without it routing stays free to
-// fall back onto paid capacity, which is the spend a spent allowance refuses.
-func serveOnCoveringSubscription(c *gin.Context) bool {
-	if !proxy.RequestPresentsCoveringSubscription(c.Request.Context(), c.Request.Header, c.FullPath()) {
-		return false
-	}
-	c.Request = c.Request.WithContext(billing.WithSubscriptionOnly(c.Request.Context()))
-	c.Next()
-	return true
-}
-
-// subscriberAllowanceCovers reports whether this request was admitted against
-// an individual Max/Boost allowance. Such a turn debits 0 on the organization
-// balance and settles against the subscriber's allowance instead, so the
-// organization's prepaid and spend-cap gates do not apply to it.
+// subscriberAllowanceCovers reports whether subscriber-owned capacity pays for
+// this turn, so organization billing gates must not inspect it.
 func subscriberAllowanceCovers(c *gin.Context) bool {
-	_, covered := entitlement.CoverageFromContext(c.Request.Context())
-	return covered
-}
-
-// exhaustedWindow returns the usage of the window that rejected the request.
-func exhaustedWindow(admission entitlement.Admission) entitlement.WindowUsage {
-	if admission.ExhaustedPeriod == entitlement.PeriodKindSixHour {
-		return admission.Usage.SixHour
+	if _, covered := entitlement.CoverageFromContext(c.Request.Context()); covered {
+		return true
 	}
-	return admission.Usage.Billing
-}
-
-func allowanceExhaustedMessage(kind entitlement.PeriodKind) string {
-	if kind == entitlement.PeriodKindSixHour {
-		return "This subscription's six-hour usage allowance is spent. Usage resets at the end of the current window."
-	}
-	return "This subscription's monthly usage allowance is spent. Usage resets when the billing period renews."
+	return false
 }

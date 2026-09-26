@@ -28,6 +28,52 @@ type RouterBlindRouterExperimentConfiguration struct {
 	Seed               uuid.UUID
 	CreatedAt          pgtype.Timestamptz
 	UpdatedAt          pgtype.Timestamptz
+	CohortExperimentID pgtype.UUID
+	CohortStartsAt     pgtype.Timestamptz
+	CohortEndsAt       pgtype.Timestamptz
+	CohortTimezone     *string
+	CohortRevision     *int32
+}
+
+type RouterBlindRouterExperimentEmergencyOverride struct {
+	ID                  uuid.UUID
+	InstallationID      uuid.UUID
+	ExperimentID        uuid.UUID
+	CanonicalSubjectKey string
+	Arm                 string
+	StartsAt            pgtype.Timestamptz
+	EndsAt              pgtype.Timestamptz
+	Reason              string
+	CreatedBy           string
+	CreatedAt           pgtype.Timestamptz
+	RevokedAt           pgtype.Timestamptz
+	RevokedBy           *string
+	RevocationReason    *string
+}
+
+type RouterBlindRouterExperimentGroup struct {
+	InstallationID uuid.UUID
+	ExperimentID   uuid.UUID
+	GroupID        int16
+	Label          string
+}
+
+type RouterBlindRouterExperimentGroupMembership struct {
+	InstallationID      uuid.UUID
+	ExperimentID        uuid.UUID
+	CanonicalSubjectKey string
+	GroupID             int16
+}
+
+type RouterBlindRouterExperimentSchedule struct {
+	InstallationID uuid.UUID
+	ExperimentID   uuid.UUID
+	Revision       int32
+	GroupID        int16
+	PhaseIndex     int16
+	StartsAt       pgtype.Timestamptz
+	EndsAt         pgtype.Timestamptz
+	Arm            string
 }
 
 type RouterBlindRouterExperimentSubjectOverride struct {
@@ -37,6 +83,34 @@ type RouterBlindRouterExperimentSubjectOverride struct {
 	ManualOverride      string
 	CreatedAt           pgtype.Timestamptz
 	UpdatedAt           pgtype.Timestamptz
+}
+
+type RouterClassifierPrediction struct {
+	ThreadID               uuid.UUID
+	TurnDigest             string
+	RootTurnDigest         string
+	UserMessageCount       int32
+	ToolCallCount          int32
+	ToolErrorCount         int32
+	CompletedResponseCount int32
+	Complexity             int16
+	Probabilities          []float64
+	CreatedAt              pgtype.Timestamptz
+	InputMessageCount      int32
+}
+
+type RouterClassifierThread struct {
+	ThreadID              uuid.UUID
+	InstallationID        uuid.UUID
+	CredentialSha256      []byte
+	RequestID             uuid.UUID
+	Release               string
+	ReleaseSha256         string
+	SelectionPolicySha256 string
+	ExpiresAt             pgtype.Timestamptz
+	CreatedAt             pgtype.Timestamptz
+	PrefixMessageCount    int32
+	PrefixDigest          string
 }
 
 type RouterClusterModelList struct {
@@ -57,6 +131,16 @@ type RouterCredentialSubject struct {
 	EnrollmentGeneration int64
 	CreatedAt            pgtype.Timestamptz
 	RevokedAt            pgtype.Timestamptz
+}
+
+// Email to credential subject per installation; lets a shared routing key serve each caller their own subscriptions and allowance
+type RouterCredentialSubjectIdentity struct {
+	SubjectID      uuid.UUID
+	InstallationID uuid.UUID
+	Email          string
+	CreatedAt      pgtype.Timestamptz
+	UpdatedAt      pgtype.Timestamptz
+	RevokedAt      pgtype.Timestamptz
 }
 
 type RouterCredentialSubjectInstallation struct {
@@ -213,6 +297,8 @@ type RouterModelRouterAPIKey struct {
 	// routing = rk_ data-plane key (can proxy and spend); analytics_read = ra_ export key (read-only, non-billable)
 	Scope               string
 	CredentialSubjectID pgtype.UUID
+	// Optional onboarding harness id (claude_code, codex, opencode, pi). Null for keys minted outside harness onboarding.
+	Harness *string
 }
 
 // Customer-owned provider API keys for BYOK routing
@@ -328,6 +414,7 @@ type RouterModelRouterInstallation struct {
 	TrialEnrollmentID                pgtype.UUID
 	TrialShadowSampleRate            pgtype.Numeric
 	TrialShadowDailyCeilingUsdMicros *int64
+	ShowModelSelectionReasoning      bool
 }
 
 type RouterModelRouterRequestTelemetry struct {
@@ -522,7 +609,27 @@ type RouterModelRouterRequestTelemetry struct {
 	// Effort level written on the wire after the target menu clamp (xhigh -> max -> high). NULL when nothing was sent.
 	EffortSent *string
 	// Precedence branch that produced the level: user, escalation, arm, model_policy. NULL when no effort resolved.
-	EffortSource *string
+	EffortSource           *string
+	SubscriberPlan         *string
+	EntitlementVersion     *int64
+	CapacitySource         *string
+	RetailUsageUsdMicros   *int64
+	IncludedUsageUsdMicros *int64
+	LinkedUsageUsdMicros   *int64
+	PrepaidUsageUsdMicros  *int64
+	SettlementFailed       *bool
+	ServingProfileID       *string
+	ServingProfileVersion  *string
+	ServingReleaseID       *string
+	ServingBindingID       *string
+	BoostOptimizerVersion  *string
+	CohortExperimentID     pgtype.UUID
+	CohortGroupID          *int16
+	CohortPhaseIndex       *int16
+	CohortRevision         *int32
+	CohortScheduledArm     *string
+	CohortTreatmentApplied *bool
+	CohortBypassReason     *string
 }
 
 type RouterModelRouterSubscriptionAccount struct {
@@ -541,6 +648,9 @@ type RouterModelRouterSubscriptionAccount struct {
 	TokenRefreshLeaseID    pgtype.UUID
 	TokenRefreshVersion    int64
 	SubscriberID           pgtype.UUID
+	HealthState            string
+	// Provider-supplied human-readable account label; never used for identity or deduplication.
+	DisplayName *string
 }
 
 // End-user identities seen on inbound requests, scoped to an installation. Replaces the per-user API key pattern.
@@ -931,6 +1041,8 @@ type RouterSubscriberAllowanceAction struct {
 	ReleasedAt         pgtype.Timestamptz
 	CreatedAt          pgtype.Timestamptz
 	UpdatedAt          pgtype.Timestamptz
+	WeeklyPeriodStart  pgtype.Timestamptz
+	WeeklyPeriodEnd    pgtype.Timestamptz
 }
 
 type RouterSubscriberAllowancePeriod struct {
@@ -945,6 +1057,27 @@ type RouterSubscriberAllowancePeriod struct {
 	FinalizedUsdMicros int64
 	CreatedAt          pgtype.Timestamptz
 	UpdatedAt          pgtype.Timestamptz
+}
+
+type RouterSubscriberAutopayConfig struct {
+	SubscriberID                uuid.UUID
+	Enabled                     bool
+	ThresholdUsdMicros          int64
+	RechargeUsdMicros           int64
+	HasPaymentMethod            bool
+	State                       string
+	ConsecutiveFailures         int32
+	CheckoutID                  pgtype.UUID
+	LastAttemptID               pgtype.UUID
+	LastAttemptAt               pgtype.Timestamptz
+	LastSuccessAt               pgtype.Timestamptz
+	CooldownUntil               pgtype.Timestamptz
+	MonthlyRechargeCapUsdMicros *int64
+	RechargedMonth              pgtype.Date
+	RechargedMonthUsdMicros     int64
+	CreatedBy                   *string
+	CreatedAt                   pgtype.Timestamptz
+	UpdatedAt                   pgtype.Timestamptz
 }
 
 type RouterSubscriberCreditBalance struct {
@@ -967,6 +1100,23 @@ type RouterSubscriberCreditLedger struct {
 	RouterModel           *string
 	Memo                  *string
 	CreatedAt             pgtype.Timestamptz
+	AuthorizationActionID *string
+	ActionID              *string
+	CapacitySource        *string
+}
+
+type RouterSubscriberCreditReservation struct {
+	ActionID          string
+	SubscriberID      uuid.UUID
+	RouterRequestID   string
+	APIKeyID          *string
+	RequestedModel    string
+	ReservedUsdMicros int64
+	SettledUsdMicros  int64
+	State             string
+	CapacitySource    string
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
 }
 
 type RouterSubscriberEntitlement struct {

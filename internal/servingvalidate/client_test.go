@@ -3,10 +3,12 @@ package servingvalidate_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -41,7 +43,7 @@ func TestPrivateValidationPreservesIAMAudienceAndExactSnapshot(t *testing.T) {
 	client, err := servingvalidate.New(server.Client(), func(_ context.Context, got string) (string, error) {
 		require.Equal(t, audience, got)
 		return "private-identity", nil
-	}, []string{server.URL, audience})
+	})
 	require.NoError(t, err)
 	revision := policyregistry.RevisionBinding{URL: server.URL, Audience: audience}
 	observedWorker, err := client.ValidateWorker(context.Background(), revision, selection)
@@ -63,7 +65,7 @@ func TestPrivateWorkerValidationPreservesEveryManagedTarget(t *testing.T) {
 	defer server.Close()
 	client, err := servingvalidate.New(server.Client(), func(context.Context, string) (string, error) {
 		return "private-identity", nil
-	}, []string{server.URL})
+	})
 	require.NoError(t, err)
 	for _, target := range []policyregistry.ServingTarget{
 		policyregistry.TargetStaging,
@@ -107,7 +109,7 @@ func TestPrivateValidationRejectsRedirectsAndIncompleteWireResponses(t *testing.
 				_, _ = w.Write([]byte(test.payload))
 			}))
 			defer server.Close()
-			client, err := servingvalidate.New(server.Client(), func(context.Context, string) (string, error) { return "private-identity", nil }, []string{server.URL})
+			client, err := servingvalidate.New(server.Client(), func(context.Context, string) (string, error) { return "private-identity", nil })
 			require.NoError(t, err)
 			_, err = client.AttestClassifier(context.Background(), policyregistry.RevisionBinding{URL: server.URL, Audience: server.URL})
 			require.ErrorContains(t, err, test.expected)
@@ -116,22 +118,55 @@ func TestPrivateValidationRejectsRedirectsAndIncompleteWireResponses(t *testing.
 	}
 }
 
-func TestPrivateValidationRejectsUnapprovedOriginsBeforeMintingTokens(t *testing.T) {
+func TestPrivateValidationRejectsNonHTTPSRevisionsBeforeMintingTokens(t *testing.T) {
 	client, err := servingvalidate.New(&http.Client{}, func(context.Context, string) (string, error) {
-		t.Error("token minted for unapproved destination")
+		t.Error("token minted for a plaintext or credentialed destination")
 		return "", nil
-	}, []string{"https://approved.example"})
+	})
 	require.NoError(t, err)
 	for _, revision := range []policyregistry.RevisionBinding{
-		{URL: "https://attacker.example", Audience: "https://approved.example"},
-		{URL: "https://approved.example", Audience: "https://attacker.example"},
-		{URL: "https://approved.example/path", Audience: "https://approved.example"},
+		{URL: "http://localhost", Audience: "https://service.example"},
+		{URL: "https://service.example", Audience: "http://service.example"},
+		{URL: "https://user:password@service.example", Audience: "https://service.example"},
+		{URL: "", Audience: "https://service.example"},
 	} {
 		_, err := client.AttestClassifier(context.Background(), revision)
-		require.ErrorContains(t, err, "approved private validation origin")
+		require.ErrorContains(t, err, "HTTPS")
 	}
-	for _, origin := range []string{"http://localhost", "https://user:password@example.com", "https://example.com/", "https://example.com?", "https://example.com#fragment"} {
-		_, err := servingvalidate.New(&http.Client{}, func(context.Context, string) (string, error) { return "", nil }, []string{origin})
-		require.Error(t, err)
-	}
+	_, err = servingvalidate.New(nil, func(context.Context, string) (string, error) { return "", nil })
+	require.Error(t, err)
+	_, err = servingvalidate.New(&http.Client{}, nil)
+	require.Error(t, err)
+}
+
+func TestPrivateValidationAllowsScaleFromZeroBeforeEndpointWork(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		deadline, ok := request.Context().Deadline()
+		require.True(t, ok)
+		require.GreaterOrEqual(t, time.Until(deadline), 90*time.Second)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"revision":"classifier-exact","ready":true}`)),
+			Header:     make(http.Header),
+			Request:    request,
+		}, nil
+	})}
+	client, err := servingvalidate.New(httpClient, func(context.Context, string) (string, error) {
+		return "private-identity", nil
+	})
+	require.NoError(t, err)
+
+	attestation, err := client.AttestClassifier(context.Background(), policyregistry.RevisionBinding{
+		URL:      "https://classifier.example",
+		Audience: "https://classifier.example",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "classifier-exact", attestation.Revision)
+	require.True(t, attestation.Ready)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }

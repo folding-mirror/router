@@ -53,7 +53,7 @@ func TestResolveForceModel(t *testing.T) {
 		{
 			name:         "alias gpt",
 			input:        "gpt",
-			wantID:       "gpt-5.6-sol",
+			wantID:       "gpt-6-sol",
 			wantProvider: providers.ProviderOpenAI,
 			wantKnown:    true,
 		},
@@ -81,7 +81,7 @@ func TestResolveForceModel(t *testing.T) {
 		{
 			name:         "native openai prefix with model alias",
 			input:        "openai/luna",
-			wantID:       "gpt-5.6-luna",
+			wantID:       "gpt-6-luna",
 			wantProvider: providers.ProviderOpenAI,
 			wantKnown:    true,
 		},
@@ -95,14 +95,14 @@ func TestResolveForceModel(t *testing.T) {
 		{
 			name:         "alias claude",
 			input:        "claude",
-			wantID:       "claude-opus-5",
+			wantID:       "claude-opus-5-5",
 			wantProvider: providers.ProviderAnthropic,
 			wantKnown:    true,
 		},
 		{
 			name:         "alias opus",
 			input:        "opus",
-			wantID:       "claude-opus-5",
+			wantID:       "claude-opus-5-5",
 			wantProvider: providers.ProviderAnthropic,
 			wantKnown:    true,
 		},
@@ -308,12 +308,12 @@ func TestBareCatalogNames_AliasesTakePrecedence(t *testing.T) {
 	}
 }
 
-// grok-4.5 is retired; family aliases (grok, xai) now follow flagship 4.6, own-name pins still resolve exactly.
+// grok-4.5 is retired; family aliases (grok, xai) follow flagship 4.7, while own-name pins resolve exactly.
 func TestResolveForceModel_GrokFamilyAlias(t *testing.T) {
 	for _, input := range []string{"grok", "xai"} {
 		t.Run(input, func(t *testing.T) {
 			gotID, gotProvider, gotKnown := resolveForceModel(input)
-			assert.Equal(t, "grok-4.6", gotID, "canonical id")
+			assert.Equal(t, "grok-4.7", gotID, "canonical id")
 			assert.Equal(t, providers.ProviderXAI, gotProvider, "provider")
 			assert.True(t, gotKnown, "known")
 		})

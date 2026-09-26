@@ -12,6 +12,7 @@ import (
 	"weave-os/router/internal/api/admin"
 	analyticsapi "weave-os/router/internal/api/analytics"
 	anthropicapi "weave-os/router/internal/api/anthropic"
+	classifierapi "weave-os/router/internal/api/classifier"
 	feedbackapi "weave-os/router/internal/api/feedback"
 	geminiapi "weave-os/router/internal/api/gemini"
 	openaiapi "weave-os/router/internal/api/openai"
@@ -142,8 +143,8 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 	if features.PolicyPinEnabled {
 		policyPinMiddleware = []gin.HandlerFunc{middleware.WithPolicyPinOverride()}
 	}
-	// Ahead of the org billing gates: a covered subscriber turn debits no org
-	// balance, so its verdict decides whether those gates see a chargeable turn.
+	// Ahead of the org billing gates: included turns skip them, while exhausted
+	// turns continue into the same organization balance and spend-limit path.
 	var subscriberAllowanceMiddleware []gin.HandlerFunc
 	if features.SubscriberAllowance != nil {
 		subscriberAllowanceMiddleware = []gin.HandlerFunc{middleware.WithSubscriberAllowance(features.SubscriberAllowance)}
@@ -205,11 +206,16 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 
 	// /internal/v1/*: control-plane-to-router calls, authed by a shared secret
 	// and mounted only when one is configured. This is not a second admin API —
-	// it carries only work the control plane cannot do itself because the
-	// credential is minted here per request (key-pair, workload identity).
+	// it carries only work the control plane cannot do itself because credentials
+	// are minted or encrypted here.
 	if internalToken := strings.TrimSpace(os.Getenv("ROUTER_INTERNAL_SERVICE_TOKEN")); internalToken != "" {
 		internalGroup := engine.Group("/internal/v1", middleware.WithTimeout(adminTimeout), middleware.WithInternalServiceAuth(internalToken))
 		internalGroup.POST("/provider-keys/models", admin.InternalListUpstreamModelsHandler(authSvc, proxySvc))
+		if authSvc.SubscriptionAccountsEnabled() {
+			internalGroup.GET("/subscription-accounts/:subscriberID", admin.InternalListSubscriptionAccountsHandler(authSvc))
+			internalGroup.PATCH("/subscription-accounts/:subscriberID/:accountID", admin.InternalUpdateSubscriptionAccountHandler(authSvc))
+			internalGroup.DELETE("/subscription-accounts/:subscriberID/:accountID", admin.InternalDeleteSubscriptionAccountHandler(authSvc))
+		}
 		// Inference-policy inspection: the reviewed registry, the deployment's
 		// view of it, and a resolution preview. Read-only and content-free; the
 		// control plane mirrors these into its policy inventory.
@@ -225,6 +231,7 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 
 	// /validate is a token-validity probe used by clients (not the dashboard), so it stays mounted in both modes.
 	adminAuthed := engine.Group("", middleware.WithTimeout(validateTimeout), middleware.WithAuth(authSvc, byokRequiresOptIn))
+	adminAuthed.POST("/v1/router/threads", classifierapi.StartThreadHandler(proxySvc))
 	adminAuthed.Use(servingAdmissionMiddleware...)
 	adminAuthed.GET("/validate", admin.ValidateHandler)
 	if authSvc.SubscriptionAccountsEnabled() {
@@ -310,6 +317,7 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 		middleware.WithForceEffortOverride(),
 	)
 	messagesMiddleware = append(messagesMiddleware, policyPinMiddleware...)
+	messagesMiddleware = append(messagesMiddleware, middleware.WithClassifierThread(proxySvc))
 	messagesGroup := engine.Group("", messagesMiddleware...)
 	messagesGroup.POST("/v1/messages", anthropicapi.MessagesHandler(proxySvc, authSvc))
 	messagesGroup.POST("/v1/route/handoff", anthropicapi.PrepareHandoffHandler(proxySvc, authSvc))
@@ -339,6 +347,7 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 		middleware.WithRoutingKnobsOverride(),
 		middleware.WithForceEffortOverride(),
 	)
+	chatCompletionMiddleware = append(chatCompletionMiddleware, middleware.WithClassifierThread(proxySvc))
 	chatCompletionWithoutPolicyPin := append([]gin.HandlerFunc(nil), chatCompletionMiddleware...)
 	chatCompletionMiddleware = append(chatCompletionMiddleware, policyPinMiddleware...)
 	chatCompletionGroup := engine.Group("", chatCompletionMiddleware...)
@@ -359,7 +368,7 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 	)
 	passthroughGroup.Use(servingAdmissionMiddleware...)
 	passthroughGroup.POST("/v1/messages/count_tokens", anthropicapi.PassthroughHandler(proxySvc))
-	passthroughGroup.GET("/v1/models", openaiapi.ModelsHandler(anthropicapi.PassthroughHandler(proxySvc)))
+	passthroughGroup.GET("/v1/models", openaiapi.ModelsHandler(anthropicapi.PassthroughHandler(proxySvc), proxySvc.CodexModelCatalog))
 	passthroughGroup.GET("/v1/models/:model", anthropicapi.PassthroughHandler(proxySvc))
 	// Rides the passthrough group (cheap, no billing middleware) — read-only, no routing side-effects.
 	passthroughGroup.GET("/v1/display-settings", admin.DisplaySettingsHandler)
@@ -390,6 +399,7 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 		middleware.WithForceEffortOverride(),
 	)
 	routeMiddleware = append(routeMiddleware, policyPinMiddleware...)
+	routeMiddleware = append(routeMiddleware, middleware.WithClassifierThread(proxySvc))
 	routeGroup := engine.Group("", routeMiddleware...)
 	routeGroup.POST("/v1/route", anthropicapi.RouteHandler(proxySvc))
 
@@ -407,6 +417,7 @@ func RegisterWithFeatures(engine *gin.Engine, authSvc *auth.Service, proxySvc *p
 		middleware.WithRoutingKnobsOverride(),
 	)
 	previewMiddleware = append(previewMiddleware, policyPinMiddleware...)
+	previewMiddleware = append(previewMiddleware, middleware.WithClassifierThread(proxySvc))
 	previewGroup := engine.Group("", previewMiddleware...)
 	previewGroup.POST("/v1/route/preview", anthropicapi.PreviewRouteHandler(proxySvc))
 

@@ -302,8 +302,8 @@ const topUpURL = "https://app.workweave.ai/organization/settings/weave-router"
 
 // subscriptionOnlyWarningMarker is prepended to a subscription-only bypass
 // response so the customer sees why they're being served on their own plan and
-// how to restore full routing. Always emitted (not gated by the routing-marker
-// opt-out): a billing state change the caller needs to see.
+// how to restore full routing. The marker is emitted only when terminal
+// surfaces are enabled for the installation and request.
 const subscriptionOnlyWarningMarker = routingMarkerPrefix +
 	"your Weave router credits are depleted, so this turn is running on your own Anthropic subscription and paid model fallback is disabled. Add credits to restore full routing: " +
 	topUpURL + "\n\n"
@@ -314,6 +314,26 @@ const subscriptionOnlyWarningMarker = routingMarkerPrefix +
 const subscriptionOnlyWarningMarkerCodex = routingMarkerPrefix +
 	"your Weave router credits are depleted, so this turn is running on your own ChatGPT (Codex) subscription and paid model fallback is disabled. Add credits to restore full routing: " +
 	topUpURL + "\n\n"
+
+// subscriptionOnlyWarnsDepleted reports whether a subscription-only turn is
+// standing in for capacity the organization could not fund, and so must carry
+// the depleted-credits warning and its top-up CTA. A linked-first turn is the
+// ordinary funded path — the caller's own plan paying first by design — and
+// keeps its routing marker, so it no longer claims credits are gone.
+func subscriptionOnlyWarnsDepleted(ctx context.Context) bool {
+	reason, ok := billing.SubscriptionOnlyReasonFromContext(ctx)
+	return ok && reason == billing.SubscriptionOnlyCreditsDepleted
+}
+
+// subscriptionOnlyWarningMarkerForRequest returns the depletion warning only
+// when the turn is subscription-only because credits are depleted and the
+// caller has not opted out of terminal routing surfaces.
+func subscriptionOnlyWarningMarkerForRequest(ctx context.Context, headers http.Header, marker string) string {
+	if !subscriptionOnlyWarnsDepleted(ctx) {
+		return ""
+	}
+	return suppressMarkerIfRequested(ctx, headers, marker)
+}
 
 // ErrCreditsExhaustedSubscriptionUnavailable is returned by ProxyMessages and
 // ProxyOpenAIChatCompletion when the org is in subscription-only mode but the
@@ -423,8 +443,8 @@ func (s *Service) bypassToAnthropic(
 		streamCost.SetCostCalculator(routerCostCalculatorFor(decision.Model, decision.Provider, opts.FastMode), false)
 		respW = streamCost
 	}
-	if billing.SubscriptionOnlyFromContext(ctx) {
-		respW = translate.NewAnthropicRoutingMarkerWriter(respW, decision.Model, subscriptionOnlyWarningMarker)
+	if warning := subscriptionOnlyWarningMarkerForRequest(ctx, r.Header, subscriptionOnlyWarningMarker); warning != "" {
+		respW = translate.NewAnthropicRoutingMarkerWriter(respW, decision.Model, warning)
 	}
 
 	// Tap the response stream so the bypass span carries token usage for
@@ -543,7 +563,7 @@ func (s *Service) bypassToAnthropic(
 			CredentialSource:       credSource,
 			UnifiedLimitHeaders:    unifiedLimitHeadersJSON(ctx),
 		}
-		applyBlindExperimentTelemetry(ctx, &telemetryParams)
+		applyBlindExperimentTelemetry(ctx, &telemetryParams, &turnLoopResult{Decision: decision, UsageBypass: true})
 		applyPolicyPinTelemetry(ctx, &telemetryParams, nil)
 		s.fireTelemetry(telemetryParams)
 	}

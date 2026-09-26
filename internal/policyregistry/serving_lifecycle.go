@@ -4,7 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strings"
 	"time"
+
+	"weave-os/router/internal/subscriptions/entitlement"
 
 	"github.com/google/uuid"
 )
@@ -17,6 +20,18 @@ const (
 	// ServingDrainGrace exceeds the current maximum 600-second worker request duration.
 	ServingDrainGrace = 15 * time.Minute
 )
+
+// MaxServingRequestIDLength bounds the workflow-minted audit key recorded on proposals and activations.
+const MaxServingRequestIDLength = 128
+
+// ValidateServingRequestID accepts any non-empty bounded string; request IDs are audit metadata,
+// not identity. Replay is keyed on the proposal reference.
+func ValidateServingRequestID(id string) error {
+	if strings.TrimSpace(id) == "" || len(id) > MaxServingRequestIDLength {
+		return errors.New("request ID must be a non-empty string of at most 128 bytes")
+	}
+	return nil
+}
 
 // Activation is an incarnation, not an artifact ID; identical selections can have many incarnations.
 type Activation struct {
@@ -42,10 +57,22 @@ type ServingControlState struct {
 	Activations         map[string]Activation `json:"activations"`
 }
 
-// ServingStateSnapshot binds state bytes to the concurrency token read with them.
+// ServingStateSnapshot binds state bytes to the concurrency token read with them. LegacyPath
+// marks a snapshot served from the pre-v2 state object, whose generation does not govern the
+// new state path.
 type ServingStateSnapshot struct {
 	State      ServingControlState `json:"state"`
 	Generation int64               `json:"generation"`
+	LegacyPath bool                `json:"legacy_path,omitempty"`
+}
+
+// WriteGeneration is the CAS token for the authoritative state path. A legacy-path snapshot has
+// no object there yet, so its successor must be created rather than replaced.
+func (s ServingStateSnapshot) WriteGeneration() int64 {
+	if s.LegacyPath {
+		return 0
+	}
+	return s.Generation
 }
 
 // ActivationOutcome describes a successful CAS or a previous idempotent success.
@@ -77,7 +104,6 @@ func (s ServingControlState) Validate(root string, target ServingTarget) error {
 		return errors.New("current activation is missing, superseded or withdrawn")
 	}
 	sequences := make(map[int64]struct{}, len(s.Activations))
-	requests := make(map[string]struct{}, len(s.Activations))
 	for id, activation := range s.Activations {
 		parsedID, err := uuid.Parse(id)
 		if err != nil || parsedID == uuid.Nil || id != parsedID.String() || id != activation.ID || activation.Sequence <= 0 || activation.Sequence > s.Sequence || activation.ActivatedAt.IsZero() || activation.Actor == "" || activation.WorkflowActor == "" {
@@ -87,17 +113,13 @@ func (s ServingControlState) Validate(root string, target ServingTarget) error {
 			return errors.New("duplicate activation sequence")
 		}
 		sequences[activation.Sequence] = struct{}{}
-		if _, err := uuid.Parse(activation.RequestID); err != nil || activation.RequestID == uuid.Nil.String() {
-			return errors.New("invalid activation request identity")
+		if err := ValidateServingRequestID(activation.RequestID); err != nil {
+			return fmt.Errorf("invalid activation request identity: %w", err)
 		}
-		if _, exists := requests[activation.RequestID]; exists {
-			return errors.New("duplicate activation idempotency identity")
-		}
-		requests[activation.RequestID] = struct{}{}
-		if err := ValidateServingRef(activation.SelectionSet, root, ServingSelectionSets); err != nil {
+		if err := ValidateServingRef(activation.SelectionSet, root, ServingSelectionSet); err != nil {
 			return err
 		}
-		if err := ValidateServingRef(activation.Proposal, root, ServingProposals); err != nil {
+		if err := ValidateServingRef(activation.Proposal, root, ServingProposal); err != nil {
 			return err
 		}
 		if id != s.CurrentActivationID && activation.SupersededAt == nil {
@@ -119,20 +141,23 @@ func (s ServingControlState) Validate(root string, target ServingTarget) error {
 	return nil
 }
 
-// NextServingActivation is pure; persistence must CAS the returned state against snapshot.Generation.
-// Callers must validate the proposed selection set and its prepared bindings before invoking it.
-func NextServingActivation(snapshot ServingStateSnapshot, proposal DeploymentProposal, proposalRef ObjectRef, root, workflowActor string, now time.Time) (ActivationResult, error) {
-	if err := proposal.Validate(root); err != nil {
-		return ActivationResult{}, err
-	}
-	if err := ValidateServingRef(proposalRef, root, ServingProposals); err != nil {
-		return ActivationResult{}, err
-	}
-	canonical, err := CanonicalBytes(proposal)
+// NextServingActivation is pure; persistence must CAS the returned state against
+// snapshot.WriteGeneration(). Callers must validate the proposed selection set and its prepared
+// bindings before invoking it. proposalPayload must be the exact stored bytes proposalRef names:
+// replay and status are keyed on the recorded proposal ref, so the activated bytes must carry the
+// digest that ref records. Either proposal version is accepted; the incumbent is bound by
+// previous_selection_set content, and a v1 proposal additionally pins the generation it previewed.
+func NextServingActivation(snapshot ServingStateSnapshot, proposalPayload []byte, proposalRef ObjectRef, root, workflowActor string, now time.Time) (ActivationResult, error) {
+	manifest, err := DecodeServingObject(proposalPayload, root, ServingProposal, proposalRef)
 	if err != nil {
 		return ActivationResult{}, err
 	}
-	if Digest(canonical) != proposalRef.SHA256 || workflowActor == "" || now.IsZero() {
+	typed, ok := manifest.(ProposalManifest)
+	if !ok {
+		return ActivationResult{}, errors.New("registry returned the wrong proposal manifest kind")
+	}
+	proposal := typed.View()
+	if Digest(proposalPayload) != proposalRef.SHA256 || workflowActor == "" || now.IsZero() {
 		return ActivationResult{}, errors.New("proposal digest, execution identity or activation clock is invalid")
 	}
 	if snapshot.Generation < 0 {
@@ -143,11 +168,8 @@ func NextServingActivation(snapshot ServingStateSnapshot, proposal DeploymentPro
 			return ActivationResult{}, err
 		}
 		for _, previous := range snapshot.State.Activations {
-			if previous.RequestID != proposal.RequestID {
-				continue
-			}
 			if previous.Proposal != proposalRef {
-				return ActivationResult{}, fmt.Errorf("request ID already belongs to a different proposal: %w", ErrConflict)
+				continue
 			}
 			outcome := ActivationCurrent
 			if previous.ID != snapshot.State.CurrentActivationID {
@@ -157,8 +179,10 @@ func NextServingActivation(snapshot ServingStateSnapshot, proposal DeploymentPro
 		}
 	} else if snapshot.State.CurrentActivationID != "" || len(snapshot.State.Activations) != 0 || snapshot.State.Sequence != 0 {
 		return ActivationResult{}, errors.New("bootstrap requires an absent target state")
+	} else if proposal.PreviousSelectionSet != nil {
+		return ActivationResult{}, fmt.Errorf("proposal binds a previous selection set but the target has no activation: %w", ErrConflict)
 	}
-	if snapshot.Generation != proposal.ExpectedGeneration {
+	if proposal.ExpectedGeneration != nil && snapshot.Generation != *proposal.ExpectedGeneration {
 		return ActivationResult{}, fmt.Errorf("target generation changed; create a new preview: %w", ErrConflict)
 	}
 	if proposal.CreatedAt.After(now) {
@@ -197,7 +221,7 @@ func NextServingActivation(snapshot ServingStateSnapshot, proposal DeploymentPro
 	if err := state.Validate(root, proposal.Target); err != nil {
 		return ActivationResult{}, err
 	}
-	return ActivationResult{Snapshot: ServingStateSnapshot{State: state, Generation: snapshot.Generation}, Activation: activation, Outcome: ActivationCurrent}, nil
+	return ActivationResult{Snapshot: ServingStateSnapshot{State: state, Generation: snapshot.Generation, LegacyPath: snapshot.LegacyPath}, Activation: activation, Outcome: ActivationCurrent}, nil
 }
 
 // SessionReleaseBinding is the release decision persisted under an authenticated conversation scope.
@@ -206,6 +230,9 @@ type SessionReleaseBinding struct {
 	ActivationID         string           `json:"activation_id"`
 	Selection            ServingSelection `json:"selection"`
 	ProfileKey           string           `json:"profile_key,omitempty"`
+	ProfileName          string           `json:"profile_name,omitempty"`
+	Plan                 entitlement.Plan `json:"plan,omitempty"`
+	EntitlementVersion   int64            `json:"entitlement_version,omitempty"`
 	EnrollmentGeneration int64            `json:"enrollment_generation"`
 	AssignmentGeneration int64            `json:"assignment_generation"`
 	BindingGeneration    int64            `json:"binding_generation"`
@@ -217,13 +244,18 @@ type SessionReleaseBinding struct {
 type AdmissionProjection struct {
 	Target               ServingTarget
 	ProfileKey           string
+	ProfileName          string
+	Plan                 entitlement.Plan
+	EntitlementVersion   int64
 	EnrollmentGeneration int64
 	AssignmentGeneration int64
 }
 
 // SelectSessionRelease applies pin lifetimes to an authoritative target read inside session serialization.
 // A nil previous binding is request-scoped when no canonical client conversation ID exists.
-func SelectSessionRelease(previous *SessionReleaseBinding, projection AdmissionProjection, snapshot ServingStateSnapshot, sets map[string]SelectionSet, root string, now time.Time) (SessionReleaseBinding, error) {
+// sets must hold each activation's selection set keyed by its activation-declared SHA256, as
+// returned by digest- and generation-verified store reads.
+func SelectSessionRelease(previous *SessionReleaseBinding, projection AdmissionProjection, snapshot ServingStateSnapshot, sets map[string]SelectionSetView, root string, now time.Time) (SessionReleaseBinding, error) {
 	if snapshot.Generation <= 0 || now.IsZero() || projection.EnrollmentGeneration < 0 || projection.AssignmentGeneration < 0 {
 		return SessionReleaseBinding{}, errors.New("admission requires authoritative state, projection and clock")
 	}
@@ -233,6 +265,18 @@ func SelectSessionRelease(previous *SessionReleaseBinding, projection AdmissionP
 	if projection.ProfileKey != "" {
 		if err := validateProfileKey(projection.ProfileKey); err != nil {
 			return SessionReleaseBinding{}, err
+		}
+	}
+	if (projection.Plan == "") != (projection.EntitlementVersion == 0) {
+		return SessionReleaseBinding{}, errors.New("plan and entitlement version must be projected together")
+	}
+	if projection.Plan == "" && projection.ProfileName != "" {
+		return SessionReleaseBinding{}, errors.New("profile name requires a subscriber plan")
+	}
+	if projection.Plan != "" {
+		profile, ok := entitlement.ServingProfileFor(projection.Plan)
+		if !ok || projection.EntitlementVersion <= 0 || projection.ProfileKey != profile.Key || projection.ProfileName != profile.Name {
+			return SessionReleaseBinding{}, errors.New("subscriber plan profile projection is invalid")
 		}
 	}
 	current := snapshot.State.Activations[snapshot.State.CurrentActivationID]
@@ -259,7 +303,7 @@ func SelectSessionRelease(previous *SessionReleaseBinding, projection AdmissionP
 			if !sameSelection(selected, previous.Selection) {
 				return SessionReleaseBinding{}, errors.New("persisted session selection differs from its activation")
 			}
-			eligible := previous.ProfileKey == projection.ProfileKey && previous.EnrollmentGeneration == projection.EnrollmentGeneration && previous.AssignmentGeneration == projection.AssignmentGeneration && now.Before(previous.LastAdmittedAt.Add(ServingIdleLifetime)) && activation.WithdrawnAt == nil && (activation.SupersededAt == nil || now.Before(activation.SupersededAt.Add(ServingRetirementLifetime)))
+			eligible := previous.ProfileKey == projection.ProfileKey && previous.ProfileName == projection.ProfileName && previous.Plan == projection.Plan && previous.EntitlementVersion == projection.EntitlementVersion && previous.EnrollmentGeneration == projection.EnrollmentGeneration && previous.AssignmentGeneration == projection.AssignmentGeneration && now.Before(previous.LastAdmittedAt.Add(ServingIdleLifetime)) && activation.WithdrawnAt == nil && (activation.SupersededAt == nil || now.Before(activation.SupersededAt.Add(ServingRetirementLifetime)))
 			if eligible {
 				retained := *previous
 				retained.LastAdmittedAt = now
@@ -271,22 +315,18 @@ func SelectSessionRelease(previous *SessionReleaseBinding, projection AdmissionP
 	if err != nil {
 		return SessionReleaseBinding{}, err
 	}
-	return SessionReleaseBinding{Target: projection.Target, ActivationID: current.ID, Selection: selection, ProfileKey: projection.ProfileKey, EnrollmentGeneration: projection.EnrollmentGeneration, AssignmentGeneration: projection.AssignmentGeneration, BindingGeneration: generation, CreatedAt: createdAt, LastAdmittedAt: now}, nil
+	return SessionReleaseBinding{Target: projection.Target, ActivationID: current.ID, Selection: selection, ProfileKey: projection.ProfileKey, ProfileName: projection.ProfileName, Plan: projection.Plan, EntitlementVersion: projection.EntitlementVersion, EnrollmentGeneration: projection.EnrollmentGeneration, AssignmentGeneration: projection.AssignmentGeneration, BindingGeneration: generation, CreatedAt: createdAt, LastAdmittedAt: now}, nil
 }
 
-func selectionForActivation(activation Activation, profileKey string, sets map[string]SelectionSet, root string, target ServingTarget) (ServingSelection, error) {
+func selectionForActivation(activation Activation, profileKey string, sets map[string]SelectionSetView, root string, target ServingTarget) (ServingSelection, error) {
 	set, exists := sets[activation.SelectionSet.SHA256]
 	if !exists {
 		return ServingSelection{}, errors.New("activation selection set unavailable")
 	}
-	if err := set.Validate(root); err != nil {
+	if err := set.validate(root); err != nil {
 		return ServingSelection{}, err
 	}
-	payload, err := CanonicalBytes(set)
-	if err != nil {
-		return ServingSelection{}, err
-	}
-	if set.Target != target || Digest(payload) != activation.SelectionSet.SHA256 {
+	if set.Target != target {
 		return ServingSelection{}, errors.New("activation selection-set identity mismatch")
 	}
 	if profileKey == "" {

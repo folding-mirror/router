@@ -55,6 +55,7 @@ func decisionFromExportRow(row sqlc.GetRoutingDecisionsForExportRow) analytics.D
 		RequestID:       row.RequestID,
 		TraceID:         row.TraceID,
 		SessionID:       row.SessionID,
+		RolloutID:       row.RolloutID,
 		DeviceID:        row.DeviceID,
 		ClientApp:       row.ClientApp,
 		TurnType:        row.TurnType,
@@ -65,12 +66,23 @@ func decisionFromExportRow(row sqlc.GetRoutingDecisionsForExportRow) analytics.D
 		RequestedModel:                  row.RequestedModel,
 		DecisionModel:                   row.DecisionModel,
 		DecisionProvider:                row.DecisionProvider,
+		RouteID:                         row.RouteID,
+		RoutingStrategy:                 row.Strategy,
+		PolicyRouteKey:                  row.PolicyRouteKey,
+		ClusterRouterVersion:            row.ClusterRouterVersion,
 		CandidateModels:                 row.CandidateModels,
 		ChosenScore:                     row.ChosenScore,
 		DecisionReason:                  row.DecisionReason,
 		BlindExperimentArm:              blindExperimentArmPtr(row.BlindExperimentArm),
 		BlindExperimentAssignmentSource: blindExperimentAssignmentSourcePtr(row.BlindExperimentAssignmentSource),
 		BlindExperimentSubjectKey:       row.BlindExperimentSubjectKey,
+		CohortExperimentID:              uuidStringPtr(row.CohortExperimentID),
+		CohortGroupID:                   int16PtrToInt64(row.CohortGroupID),
+		CohortPhaseIndex:                int16PtrToInt64(row.CohortPhaseIndex),
+		CohortRevision:                  int32PtrToInt64(row.CohortRevision),
+		CohortScheduledArm:              blindExperimentArmPtr(row.CohortScheduledArm),
+		CohortTreatmentApplied:          row.CohortTreatmentApplied,
+		CohortBypassReason:              cohortBypassReasonPtr(row.CohortBypassReason),
 		PolicyPinRequested:              row.PolicyPinRequested,
 		PolicyPinHonoured:               row.PolicyPinHonoured,
 		StickyHit:                       row.StickyHit != nil && *row.StickyHit,
@@ -87,15 +99,33 @@ func decisionFromExportRow(row sqlc.GetRoutingDecisionsForExportRow) analytics.D
 		ActualInputCostUSD:  servedCostUSD(row.ActualInputCostUsd, row.SubscriptionServed),
 		ActualOutputCostUSD: servedCostUSD(row.ActualOutputCostUsd, row.SubscriptionServed),
 
-		RouteLatencyMs:        row.RouteLatencyMs,
-		UpstreamLatencyMs:     row.UpstreamLatencyMs,
-		TotalLatencyMs:        row.TotalLatencyMs,
-		TTFTMs:                row.TtftMs,
-		UpstreamStatusCode:    int32PtrToInt64(row.UpstreamStatusCode),
-		UpstreamFinishReason:  row.UpstreamFinishReason,
-		StopReason:            row.StopReason,
-		ToolUseBlocks:         int32PtrToInt64(row.ToolUseBlocks),
-		InvalidToolArgsBlocks: int32PtrToInt64(row.InvalidToolArgsBlocks),
+		RouteLatencyMs:           row.RouteLatencyMs,
+		UpstreamLatencyMs:        row.UpstreamLatencyMs,
+		TotalLatencyMs:           row.TotalLatencyMs,
+		TTFTMs:                   row.TtftMs,
+		UpstreamStatusCode:       int32PtrToInt64(row.UpstreamStatusCode),
+		UpstreamFinishReason:     row.UpstreamFinishReason,
+		StopReason:               row.StopReason,
+		ToolUseBlocks:            int32PtrToInt64(row.ToolUseBlocks),
+		InvalidToolArgsBlocks:    int32PtrToInt64(row.InvalidToolArgsBlocks),
+		SubscriberPlan:           row.SubscriberPlan,
+		EntitlementVersion:       row.EntitlementVersion,
+		CapacitySource:           row.CapacitySource,
+		RetailUsageUSDMicros:     row.RetailUsageUsdMicros,
+		IncludedUsageUSDMicros:   row.IncludedUsageUsdMicros,
+		LinkedUsageUSDMicros:     row.LinkedUsageUsdMicros,
+		PrepaidUsageUSDMicros:    row.PrepaidUsageUsdMicros,
+		SettlementFailed:         row.SettlementFailed,
+		ServingProfileID:         row.ServingProfileID,
+		ServingProfileVersion:    row.ServingProfileVersion,
+		ServingReleaseID:         row.ServingReleaseID,
+		ServingBindingID:         row.ServingBindingID,
+		BoostOptimizerVersion:    row.BoostOptimizerVersion,
+		PolicyArtifactID:         row.PolicyArtifactID,
+		PolicyArtifactSHA256:     row.PolicyArtifactSha256,
+		RosterVersion:            row.RosterVersion,
+		SelectionPolicyReleaseID: row.SelectionPolicyReleaseID,
+		SelectionPolicySHA256:    row.SelectionPolicySha256,
 
 		ClientGitHeadSHA: row.ClientGitHeadSha,
 		ClientGitBranch:  row.ClientGitBranch,
@@ -117,6 +147,22 @@ func blindExperimentAssignmentSourcePtr(value *string) *auth.BlindExperimentAssi
 	}
 	source := auth.BlindExperimentAssignmentSource(*value)
 	return &source
+}
+
+func cohortBypassReasonPtr(value *string) *auth.CohortBypassReason {
+	if value == nil {
+		return nil
+	}
+	reason := auth.CohortBypassReason(*value)
+	return &reason
+}
+
+func int16PtrToInt64(value *int16) *int64 {
+	if value == nil {
+		return nil
+	}
+	converted := int64(*value)
+	return &converted
 }
 
 func int32PtrToInt64(v *int32) *int64 {

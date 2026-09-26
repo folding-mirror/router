@@ -120,12 +120,14 @@ const (
 	retiredKeyStruggleEscalationEnabled Key = "struggle_escalation_enabled"
 	retiredKeyStruggleEscalationHoldout Key = "struggle_escalation_holdout_pct"
 	retiredKeyStruggleEvidenceArming    Key = "struggle_evidence_arming"
+	retiredKeySubscriberPaidFallback    Key = "subscriber_paid_fallback_enabled"
 )
 
 var retiredOverrideKeys = map[Key]struct{}{
 	retiredKeyStruggleEscalationEnabled: {},
 	retiredKeyStruggleEscalationHoldout: {},
 	retiredKeyStruggleEvidenceArming:    {},
+	retiredKeySubscriberPaidFallback:    {},
 }
 
 // Definition describes one overridable flag. DeploymentDefault is not stored
@@ -146,7 +148,7 @@ type Definition struct {
 // RegistryVersion changes whenever Registry's membership changes. Publish uses
 // it to make pruning safe during rolling deploys: a revision with an older
 // registry version may not delete definitions published by a newer revision.
-const RegistryVersion = 21
+const RegistryVersion = 22
 
 // Registry is the curated allowlist of flags that may carry a per-organization
 // override. It is deliberately explicit rather than derived from the env var

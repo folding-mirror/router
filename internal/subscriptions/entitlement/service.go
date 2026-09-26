@@ -32,9 +32,15 @@ type Coverage struct {
 	EntitlementVersion    int64
 	Plan                  Plan
 	BillingPeriod         Period
+	WeeklyPeriod          Period
 	SixHourPeriod         Period
 	BillingLimitUsdMicros int64
+	WeeklyLimitUsdMicros  int64
 	SixHourLimitUsdMicros int64
+	BillingUsedUsdMicros  int64
+	WeeklyUsedUsdMicros   int64
+	SixHourUsedUsdMicros  int64
+	ProjectedUsdMicros    int64
 }
 
 // Admission is the verdict plus the usage that produced it.
@@ -49,6 +55,25 @@ type Admission struct {
 	// ExhaustedPeriod names the spent window for AdmissionExhausted.
 	ExhaustedPeriod PeriodKind
 	Usage           Usage
+}
+
+// HeldCapacityOnly reports that the limiting windows would have headroom
+// without in-flight reservations. A subscriber whose finalized usage actually
+// reached a limit can still use their organization's normal payment fallback.
+func (a Admission) HeldCapacityOnly() bool {
+	if a.Outcome != AdmissionExhausted {
+		return false
+	}
+	held := false
+	for _, window := range []WindowUsage{a.Usage.Billing, a.Usage.Weekly, a.Usage.SixHour} {
+		if window.FinalizedUsdMicros >= window.LimitUsdMicros {
+			return false
+		}
+		if window.ConsumedUsdMicros() >= window.LimitUsdMicros {
+			held = true
+		}
+	}
+	return held
 }
 
 // Service admits requests against a subscriber's included Router allowance and
@@ -78,9 +103,9 @@ func (s *Service) WithClock(now func() time.Time) *Service {
 // that already gate them, and a stale projection must not hand out free usage.
 //
 // The month's allowance is the projected one, which Weave prorates across the
-// entitlement segments covering the period. The window cap is derived here
-// instead: it depends on the window being admitted, not only on the
-// entitlement, so it cannot be a single projected scalar.
+// entitlement segments covering the period. The weekly and six-hour caps are
+// derived here instead: they depend on the window being admitted, not only on
+// the entitlement, so they cannot be projected scalars.
 //
 // Read failures are surfaced, never swallowed — an allowance that admits
 // everything on a database error is an unbilled-usage hole.
@@ -103,16 +128,19 @@ func (s *Service) Admit(ctx context.Context, subscriberID SubscriberID) (Admissi
 	}
 	at := s.now().UTC()
 	if current.Status != StatusActive || !current.BillingPeriod.Covers(at) {
-		return Admission{Outcome: AdmissionNotSubscribed}, nil
+		return Admission{Outcome: AdmissionNotSubscribed, Plan: current.Plan}, nil
 	}
 
 	sixHour := SixHourWindowAt(at)
-	usage, err := s.allowances.Usage(ctx, subscriberID, current.BillingPeriod, sixHour)
+	weekly := WeeklyWindowAt(current.BillingPeriod, at)
+	usage, err := s.allowances.Usage(ctx, subscriberID, current.BillingPeriod, weekly, sixHour)
 	if err != nil {
 		return Admission{}, fmt.Errorf("read subscriber allowance usage: %w", err)
 	}
+	weeklyLimit := WeeklyAllowanceUsdMicros(current.NominalMonthlyAllowanceUsdMicros, current.BillingPeriod, weekly)
 	sixHourLimit := SixHourAllowanceUsdMicros(current.NominalMonthlyAllowanceUsdMicros, current.BillingPeriod, sixHour)
 	usage.Billing.LimitUsdMicros = current.MonthlyAllowanceUsdMicros
+	usage.Weekly.LimitUsdMicros = weeklyLimit
 	usage.SixHour.LimitUsdMicros = sixHourLimit
 
 	if exhausted, kind := spentWindow(usage); exhausted {
@@ -128,19 +156,28 @@ func (s *Service) Admit(ctx context.Context, subscriberID SubscriberID) (Admissi
 			EntitlementVersion:    current.Version,
 			Plan:                  current.Plan,
 			BillingPeriod:         current.BillingPeriod,
+			WeeklyPeriod:          weekly,
 			SixHourPeriod:         sixHour,
 			BillingLimitUsdMicros: current.MonthlyAllowanceUsdMicros,
+			WeeklyLimitUsdMicros:  weeklyLimit,
 			SixHourLimitUsdMicros: sixHourLimit,
+			BillingUsedUsdMicros:  usage.Billing.ConsumedUsdMicros(),
+			WeeklyUsedUsdMicros:   usage.Weekly.ConsumedUsdMicros(),
+			SixHourUsedUsdMicros:  usage.SixHour.ConsumedUsdMicros(),
 		},
 	}, nil
 }
 
-// spentWindow reports the first exhausted enforcement window. The billing month
-// is checked first so an exhausted month is reported as such even in a six-hour
-// window that is also spent — the remediation differs.
+// spentWindow reports the first exhausted enforcement window, longest first:
+// an exhausted month is reported as such even when the week and the six-hour
+// window inside it are also spent, because the remediation differs — a top-up
+// or renewal for the month, the turn of the clock for the shorter windows.
 func spentWindow(usage Usage) (bool, PeriodKind) {
 	if usage.Billing.ConsumedUsdMicros() >= usage.Billing.LimitUsdMicros {
 		return true, PeriodKindBilling
+	}
+	if usage.Weekly.ConsumedUsdMicros() >= usage.Weekly.LimitUsdMicros {
+		return true, PeriodKindWeekly
 	}
 	if usage.SixHour.ConsumedUsdMicros() >= usage.SixHour.LimitUsdMicros {
 		return true, PeriodKindSixHour
@@ -189,6 +226,7 @@ func (s *Service) Settle(ctx context.Context, settlement Settlement) error {
 		EntitlementVersion:    settlement.Coverage.EntitlementVersion,
 		Plan:                  settlement.Coverage.Plan,
 		BillingPeriod:         settlement.Coverage.BillingPeriod,
+		WeeklyPeriod:          settlement.Coverage.WeeklyPeriod,
 		SixHourPeriod:         settlement.Coverage.SixHourPeriod,
 		APIKeyID:              settlement.APIKeyID,
 		ClientSessionID:       settlement.ClientSessionID,
@@ -197,6 +235,7 @@ func (s *Service) Settle(ctx context.Context, settlement Settlement) error {
 		CapacitySource:        settlement.CapacitySource,
 		ReservedAt:            settlement.Coverage.AdmittedAt,
 		BillingLimitUsdMicros: settlement.Coverage.BillingLimitUsdMicros,
+		WeeklyLimitUsdMicros:  settlement.Coverage.WeeklyLimitUsdMicros,
 		SixHourLimitUsdMicros: settlement.Coverage.SixHourLimitUsdMicros,
 	}
 	action, err := s.allowances.Reserve(ctx, reservation)

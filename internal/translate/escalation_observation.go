@@ -52,12 +52,18 @@ type EscalationObservation struct {
 	HistoryComplete  bool                    `json:"history_complete"`
 	ContinuationID   string                  `json:"continuation_id,omitempty"`
 	ItemReferenceIDs []string                `json:"item_reference_ids,omitempty"`
+	// CodexToolResults is set by the proxy for identified Codex Responses ingress,
+	// never from tool names or body fields. It is not part of replay identity.
+	CodexToolResults bool `json:"-"`
 }
 
 // EscalationMessage keeps text and tool events in their original relative order.
 type EscalationMessage struct {
 	Role   EscalationRole    `json:"role"`
 	Blocks []EscalationBlock `json:"blocks"`
+	// HasOmittedMedia prevents text-only consumers from claiming complete input
+	// identity. It records no media payload and leaves the escalation wire intact.
+	HasOmittedMedia bool `json:"-"`
 }
 
 // EscalationBlock retains raw JSON for arguments/results, including custom-tool strings.
@@ -76,11 +82,13 @@ type EscalationBlock struct {
 
 type escalationWireType string
 
-type escalationToolStatus string
+// EscalationToolStatus is a wire status used to count explicit tool failures.
+type EscalationToolStatus string
 
 const (
-	escalationToolStatusError  escalationToolStatus = "error"
-	escalationToolStatusFailed escalationToolStatus = "failed"
+	EscalationToolStatusError     EscalationToolStatus = "error"
+	EscalationToolStatusFailed    EscalationToolStatus = "failed"
+	EscalationToolStatusCompleted EscalationToolStatus = "completed"
 )
 
 const (
@@ -95,6 +103,7 @@ const (
 	escalationWireCustomCall       escalationWireType = "custom_tool_call"
 	escalationWireFunctionOutput   escalationWireType = "function_call_output"
 	escalationWireCustomOutput     escalationWireType = "custom_tool_call_output"
+	escalationWireWebSearchCall    escalationWireType = "web_search_call"
 	escalationWireReference        escalationWireType = "item_reference"
 	escalationWireThinking         escalationWireType = "thinking"
 	escalationWireRedactedThinking escalationWireType = "redacted_thinking"
@@ -120,22 +129,22 @@ func (e *RequestEnvelope) EscalationObservation() (EscalationObservation, error)
 	switch e.format {
 	case FormatAnthropic:
 		if root.Get("system").Exists() {
-			blocks, err := escalationContentBlocks(root.Get("system"))
+			blocks, hasOmittedMedia, err := escalationContentBlocks(root.Get("system"))
 			if err != nil {
 				return observation, err
 			}
-			observation.Messages = append(observation.Messages, EscalationMessage{Role: EscalationRoleSystem, Blocks: blocks})
+			observation.Messages = append(observation.Messages, EscalationMessage{Role: EscalationRoleSystem, Blocks: blocks, HasOmittedMedia: hasOmittedMedia})
 		}
 		for _, message := range root.Get("messages").Array() {
 			role, err := escalationSemanticRole(message.Get("role").String())
 			if err != nil {
 				return observation, err
 			}
-			blocks, err := escalationContentBlocks(message.Get("content"))
+			blocks, hasOmittedMedia, err := escalationContentBlocks(message.Get("content"))
 			if err != nil {
 				return observation, err
 			}
-			observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks})
+			observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks, HasOmittedMedia: hasOmittedMedia})
 		}
 	case FormatOpenAI:
 		if root.Get("input").Exists() || root.Get("previous_response_id").Exists() {
@@ -147,10 +156,11 @@ func (e *RequestEnvelope) EscalationObservation() (EscalationObservation, error)
 				return observation, err
 			}
 			blocks := make([]EscalationBlock, 0)
+			hasOmittedMedia := false
 			if role == EscalationRoleTool {
 				blocks = append(blocks, EscalationBlock{Type: EscalationBlockToolResult, CallID: message.Get("tool_call_id").String(), Name: message.Get("name").String(), ContentJSON: escalationJSON(message.Get("content")), IsError: escalationErrorFlag(message)})
 			} else {
-				blocks, err = escalationContentBlocks(message.Get("content"))
+				blocks, hasOmittedMedia, err = escalationContentBlocks(message.Get("content"))
 				if err != nil {
 					return observation, err
 				}
@@ -168,7 +178,7 @@ func (e *RequestEnvelope) EscalationObservation() (EscalationObservation, error)
 					blocks = append(blocks, EscalationBlock{Type: EscalationBlockToolCall, Name: function.Get("name").String(), ArgumentsJSON: escalationArguments(function.Get("arguments"))})
 				}
 			}
-			observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks})
+			observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks, HasOmittedMedia: hasOmittedMedia})
 		}
 	case FormatGemini:
 		system := root.Get("systemInstruction")
@@ -176,11 +186,11 @@ func (e *RequestEnvelope) EscalationObservation() (EscalationObservation, error)
 			system = root.Get("system_instruction")
 		}
 		if system.Exists() {
-			blocks, err := escalationGeminiBlocks(system.Get("parts"))
+			blocks, hasOmittedMedia, err := escalationGeminiBlocks(system.Get("parts"))
 			if err != nil {
 				return observation, err
 			}
-			observation.Messages = append(observation.Messages, EscalationMessage{Role: EscalationRoleSystem, Blocks: blocks})
+			observation.Messages = append(observation.Messages, EscalationMessage{Role: EscalationRoleSystem, Blocks: blocks, HasOmittedMedia: hasOmittedMedia})
 		}
 		for _, message := range root.Get("contents").Array() {
 			roleName := message.Get("role").String()
@@ -191,11 +201,11 @@ func (e *RequestEnvelope) EscalationObservation() (EscalationObservation, error)
 			if err != nil {
 				return observation, err
 			}
-			blocks, err := escalationGeminiBlocks(message.Get("parts"))
+			blocks, hasOmittedMedia, err := escalationGeminiBlocks(message.Get("parts"))
 			if err != nil {
 				return observation, err
 			}
-			observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks})
+			observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks, HasOmittedMedia: hasOmittedMedia})
 		}
 	default:
 		return observation, fmt.Errorf("unsupported escalation request format %d", e.format)
@@ -214,7 +224,10 @@ func ParseResponsesEscalationObservation(body []byte) (EscalationObservation, er
 	root := gjson.ParseBytes(body)
 	observation.ContinuationID = root.Get("previous_response_id").String()
 	observation.HistoryComplete = observation.ContinuationID == ""
-	if instructions := root.Get("instructions"); instructions.Type == gjson.String {
+	if instructions := root.Get("instructions"); instructions.Exists() && instructions.Type != gjson.Null {
+		if instructions.Type != gjson.String {
+			return observation, fmt.Errorf("Responses instructions must be a string or null")
+		}
 		observation.Messages = append(observation.Messages, EscalationMessage{Role: EscalationRoleSystem, Blocks: []EscalationBlock{{Type: EscalationBlockText, Text: instructions.String()}}})
 	}
 	input := root.Get("input")
@@ -223,7 +236,7 @@ func ParseResponsesEscalationObservation(body []byte) (EscalationObservation, er
 	} else if input.Exists() && !input.IsArray() {
 		return observation, fmt.Errorf("Responses input must be a string or array")
 	} else {
-		for _, item := range input.Array() {
+		for itemIndex, item := range input.Array() {
 			kind := escalationWireType(item.Get("type").String())
 			if kind == "" && item.Get("role").Exists() {
 				kind = escalationWireMessage
@@ -241,11 +254,11 @@ func ParseResponsesEscalationObservation(body []byte) (EscalationObservation, er
 				if err != nil {
 					return observation, err
 				}
-				blocks, err := escalationContentBlocks(item.Get("content"))
+				blocks, hasOmittedMedia, err := escalationContentBlocks(item.Get("content"))
 				if err != nil {
 					return observation, err
 				}
-				observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks})
+				observation.Messages = append(observation.Messages, EscalationMessage{Role: role, Blocks: blocks, HasOmittedMedia: hasOmittedMedia})
 			case escalationWireFunctionCall, escalationWireCustomCall:
 				if !escalationNamedTool(item) {
 					return observation, fmt.Errorf("invalid Responses tool call")
@@ -261,6 +274,26 @@ func ParseResponsesEscalationObservation(body []byte) (EscalationObservation, er
 				observation.Messages = append(observation.Messages, EscalationMessage{Role: EscalationRoleAssistant, Blocks: []EscalationBlock{{Type: EscalationBlockToolCall, ID: callID, Name: item.Get("name").String(), Namespace: item.Get("namespace").String(), ArgumentsJSON: arguments}}})
 			case escalationWireFunctionOutput, escalationWireCustomOutput:
 				observation.Messages = append(observation.Messages, EscalationMessage{Role: EscalationRoleTool, Blocks: []EscalationBlock{{Type: EscalationBlockToolResult, CallID: item.Get("call_id").String(), ContentJSON: escalationJSON(item.Get("output")), IsError: escalationErrorFlag(item)}}})
+			case escalationWireWebSearchCall:
+				callID := item.Get("id")
+				status := EscalationToolStatus(item.Get("status").String())
+				if (callID.Exists() && (callID.Type != gjson.String || strings.TrimSpace(callID.String()) == "")) || !item.Get("action").IsObject() ||
+					(status != EscalationToolStatusCompleted && status != EscalationToolStatusFailed) {
+					return observation, fmt.Errorf("invalid or unfinished Responses web search call")
+				}
+				searchID := callID.String()
+				if !callID.Exists() {
+					// Older clients omit native IDs on replay. The input position
+					// is stable under the append-only checkpoint and counts repeats.
+					searchID = fmt.Sprintf("__weave_native_web_search_%d", itemIndex)
+				}
+				// Server-executed searches have no separate client output item.
+				// Keep the terminal event intact as the paired result for identity.
+				failed := status == EscalationToolStatusFailed
+				observation.Messages = append(observation.Messages,
+					EscalationMessage{Role: EscalationRoleAssistant, Blocks: []EscalationBlock{{Type: EscalationBlockToolCall, ID: searchID, Name: string(kind), ArgumentsJSON: escalationJSON(item.Get("action"))}}},
+					EscalationMessage{Role: EscalationRoleTool, Blocks: []EscalationBlock{{Type: EscalationBlockToolResult, CallID: searchID, ContentJSON: escalationJSON(item), IsError: &failed}}},
+				)
 			case escalationWireReference:
 				referenceID := item.Get("id").String()
 				if referenceID == "" {
@@ -311,16 +344,17 @@ func escalationSemanticRole(role string) (EscalationRole, error) {
 	}
 }
 
-func escalationContentBlocks(content gjson.Result) ([]EscalationBlock, error) {
+func escalationContentBlocks(content gjson.Result) ([]EscalationBlock, bool, error) {
 	blocks := make([]EscalationBlock, 0)
+	hasOmittedMedia := false
 	if content.Type == gjson.String {
-		return append(blocks, EscalationBlock{Type: EscalationBlockText, Text: content.String()}), nil
+		return append(blocks, EscalationBlock{Type: EscalationBlockText, Text: content.String()}), false, nil
 	}
 	if !content.Exists() || content.Type == gjson.Null {
-		return blocks, nil
+		return blocks, false, nil
 	}
 	if !content.IsArray() {
-		return nil, fmt.Errorf("observation content must be a string or array")
+		return nil, false, fmt.Errorf("observation content must be a string or array")
 	}
 	for _, block := range content.Array() {
 		kind := escalationWireType(block.Get("type").String())
@@ -329,21 +363,24 @@ func escalationContentBlocks(content gjson.Result) ([]EscalationBlock, error) {
 			blocks = append(blocks, EscalationBlock{Type: EscalationBlockText, Text: block.Get("text").String()})
 		case escalationWireToolUse:
 			if !escalationNamedTool(block) {
-				return nil, fmt.Errorf("invalid observation tool use")
+				return nil, false, fmt.Errorf("invalid observation tool use")
 			}
 			blocks = append(blocks, EscalationBlock{Type: EscalationBlockToolCall, ID: block.Get("id").String(), Name: block.Get("name").String(), ArgumentsJSON: escalationJSON(block.Get("input"))})
 		case escalationWireToolResult:
 			blocks = append(blocks, EscalationBlock{Type: EscalationBlockToolResult, CallID: block.Get("tool_use_id").String(), ContentJSON: escalationJSON(block.Get("content")), IsError: escalationErrorFlag(block)})
-		case escalationWireThinking, escalationWireRedactedThinking, escalationWireReasoning, escalationWireImage, escalationWireImageURL, escalationWireInputImage, escalationWireInputAudio, escalationWireDocument, escalationWireFile, escalationWireInputFile:
+		case escalationWireThinking, escalationWireRedactedThinking, escalationWireReasoning:
+		case escalationWireImage, escalationWireImageURL, escalationWireInputImage, escalationWireInputAudio, escalationWireDocument, escalationWireFile, escalationWireInputFile:
+			hasOmittedMedia = true
 		default:
-			return nil, fmt.Errorf("unsupported observation content block %q", kind)
+			return nil, false, fmt.Errorf("unsupported observation content block %q", kind)
 		}
 	}
-	return blocks, nil
+	return blocks, hasOmittedMedia, nil
 }
 
-func escalationGeminiBlocks(parts gjson.Result) ([]EscalationBlock, error) {
+func escalationGeminiBlocks(parts gjson.Result) ([]EscalationBlock, bool, error) {
 	blocks := make([]EscalationBlock, 0)
+	hasOmittedMedia := false
 	for _, part := range parts.Array() {
 		if part.Get("thought").Bool() {
 			continue
@@ -358,7 +395,7 @@ func escalationGeminiBlocks(parts gjson.Result) ([]EscalationBlock, error) {
 		}
 		if call.Exists() {
 			if !escalationNamedTool(call) {
-				return nil, fmt.Errorf("invalid Gemini function call")
+				return nil, false, fmt.Errorf("invalid Gemini function call")
 			}
 			arguments := call.Get("args")
 			if !arguments.Exists() {
@@ -373,7 +410,7 @@ func escalationGeminiBlocks(parts gjson.Result) ([]EscalationBlock, error) {
 		}
 		if response.Exists() {
 			if !escalationNamedTool(response) {
-				return nil, fmt.Errorf("invalid Gemini function response")
+				return nil, false, fmt.Errorf("invalid Gemini function response")
 			}
 			isError := escalationErrorFlag(response)
 			if isError == nil {
@@ -383,11 +420,12 @@ func escalationGeminiBlocks(parts gjson.Result) ([]EscalationBlock, error) {
 			continue
 		}
 		if part.Get("inlineData").Exists() || part.Get("inline_data").Exists() || part.Get("fileData").Exists() || part.Get("file_data").Exists() {
+			hasOmittedMedia = true
 			continue
 		}
-		return nil, fmt.Errorf("unsupported Gemini observation part")
+		return nil, false, fmt.Errorf("unsupported Gemini observation part")
 	}
-	return blocks, nil
+	return blocks, hasOmittedMedia, nil
 }
 
 func escalationNamedTool(value gjson.Result) bool {
@@ -400,8 +438,8 @@ func escalationErrorFlag(value gjson.Result) *bool {
 		verdict := flag.Bool()
 		return &verdict
 	}
-	switch escalationToolStatus(value.Get("status").String()) {
-	case escalationToolStatusError, escalationToolStatusFailed:
+	switch EscalationToolStatus(value.Get("status").String()) {
+	case EscalationToolStatusError, EscalationToolStatusFailed:
 		verdict := true
 		return &verdict
 	}

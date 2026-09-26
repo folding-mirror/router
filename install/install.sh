@@ -53,8 +53,9 @@
 #   npx @weave-os/router --local                          # local router on localhost:8080
 #   npx @weave-os/router --base-url http://localhost:8080 # self-hosted, custom port
 #   npx @weave-os/router --email you@example.com          # set the router identity email without prompting
+#   npx @weave-os/router --return-url https://example.com # open a URL after a verified install
 #   npx @weave-os/router --non-interactive                # require WEAVE_ROUTER_KEY env var (defaults target to claude)
-#   npx @weave-os/router --quiet                          # suppress banner, ping check, and trailing tips
+#   npx @weave-os/router --quiet                          # suppress banner, ping check, and trailing tips (return-url still verifies)
 #   npx @weave-os/router --rotate-key                     # ignore the installed key and prompt for a new one
 #   npx @weave-os/router --uninstall                      # remove a previous install (delegates to uninstall.sh)
 #
@@ -121,6 +122,7 @@ base_url=""
 base_url_explicit="false"
 email=""
 email_explicit="false"
+return_url=""
 non_interactive="false"
 quiet="false"
 router_key_header="X-Weave-Router-Key"
@@ -164,6 +166,8 @@ rotate_key="false"
 # Where $api_key came from: env | disk | prompt. Drives the fallback re-prompt
 # when /validate rejects a key we read back off disk.
 api_key_source=""
+# Set by verify_install; a return URL is opened only after both probes pass.
+install_verification_succeeded="false"
 
 # ---------- helpers ----------
 
@@ -676,14 +680,44 @@ strip_weave_codex_hooks() {
   rm -f "$tmp" 2>/dev/null || true
 }
 
+# codex_existing_option finds a Codex setting before the managed block is
+# replaced. Codex can save a selection inside our old block or immediately
+# after it, where TOML incorrectly scopes it to the preceding table.
+codex_existing_option() {
+  local config_file="$1" option="$2"
+  [ -f "$config_file" ] || return 0
+  awk -v begin="$WEAVE_CODEX_BEGIN_MARKER" -v end="$WEAVE_CODEX_END_MARKER" -v key="$option" '
+    BEGIN { option_pattern = "^[[:space:]]*" key "[[:space:]]*=" }
+    $0 == begin { in_managed = 1; managed_top = 1; after_managed = 0; next }
+    $0 == end { in_managed = 0; after_managed = 1; next }
+    /^[[:space:]]*\[/ {
+      in_section = 1
+      if (in_managed) managed_top = 0
+      else after_managed = 0
+      in_weave_provider = ($0 ~ /^[[:space:]]*\[[[:space:]]*model_providers[[:space:]]*\.[[:space:]]*weave[[:space:]]*\][[:space:]]*(#.*)?$/)
+      next
+    }
+    $0 ~ option_pattern {
+      if (!in_managed && !in_section) outside = $0
+      else if (!in_managed && (after_managed || in_weave_provider)) misplaced = $0
+      else if (in_managed && managed_top) managed = $0
+    }
+    END {
+      if (outside != "") print "T" outside
+      else if (misplaced != "") print "S" misplaced
+      else if (managed != "") print "B" managed
+    }
+  ' "$config_file"
+}
+
 # write_codex_config writes a managed [model_providers.weave] block to the
 # Codex CLI's config.toml. Sets `model_provider = "weave"` at the top level so
 # Codex picks the routed provider by default. The provider requires OpenAI
 # authentication, preserving the user's ChatGPT plan credential while the
 # router key is sent independently. The router applies OAuth only to its
 # native gpt-5.6 Sol/Terra/Luna family; all other routed models use WorkWeave
-# deployment or BYOK credentials. Both settings live inside the managed-block
-# markers so uninstall removes them cleanly. We strip any
+# deployment or BYOK credentials. The model choice stays outside the managed
+# markers so Codex can update it without a reinstall resetting it. We strip any
 # top-level `model_provider = ...` declaration OUTSIDE the markers before
 # appending so the file doesn't end up with a duplicate key (TOML rejects
 # that). Inline `model_provider` keys inside `[profiles.*]` sections stay
@@ -696,6 +730,24 @@ write_codex_config() {
   local block_key="$3"
   local block_email="${4:-}"
   local block_name="${5:-}"
+
+  if [ "${WEAVE_CAPTURE_LLM_CLASSIFIER:-}" = "1" ]; then
+    local capture_url="${WEAVE_CAPTURE_PROXY_URL:-http://127.0.0.1:41984}"
+    if ! [[ "$capture_url" =~ ^http://(127\.0\.0\.1|localhost):[0-9]+$ ]]; then
+      err "Classifier opt-in requires a loopback WEAVE_CAPTURE_PROXY_URL"
+      return 1
+    fi
+    block_url="$capture_url"
+    if ! command -v jq >/dev/null 2>&1; then
+      err "Classifier opt-in requires jq to verify the capture proxy"
+      return 1
+    fi
+    if ! curl -fsS --max-time 2 "$capture_url/healthz" | jq -e --arg upstream "$2" \
+      '.classifier_enabled == true and .upstream == $upstream' >/dev/null; then
+      err "Classifier capture proxy is unavailable or targets a different router"
+      return 1
+    fi
+  fi
 
   # Escape `\` and `"` for TOML basic strings. Order matters: replace
   # backslashes first so the quotes we add next aren't double-escaped. A
@@ -730,11 +782,21 @@ write_codex_config() {
   # Tag the client so telemetry can attribute traffic to Codex vs other CLIs
   # that share the same router key. The router otherwise has to guess from
   # User-Agent.
-  headers_parts="${headers_parts}, \"X-App\" = \"codex\""
+  headers_parts="${headers_parts}, \"X-App\" = \"codex\", \"X-Weave-Codex-Native-Model-Pin\" = \"1\""
   # No strategy header: pinning one here freezes installed clients on whatever
   # policy was current at install time, so a deployment-default change never
   # reaches them. Every endpoint, hosted or self-hosted, uses its own default.
   local headers_line="http_headers = { ${headers_parts} }"
+  local codex_model_line='model = "weave-auto"' codex_effort_line="" saved_option
+  saved_option="$(codex_existing_option "$config_file" model)"
+  case "${saved_option:0:1}" in
+    T) codex_model_line="" ;;
+    S|B) codex_model_line="${saved_option:1}" ;;
+  esac
+  saved_option="$(codex_existing_option "$config_file" model_reasoning_effort)"
+  case "${saved_option:0:1}" in
+    S|B) codex_effort_line="${saved_option:1}" ;;
+  esac
 
   local hook_feature_line="features.hooks = true"
   local hook_block=""
@@ -752,6 +814,10 @@ write_codex_config() {
   fi
   if [ -f "$config_file" ] && grep -q '^\[features\]$' "$config_file"; then
     hook_feature_line=""
+  fi
+  if [ "${WEAVE_CAPTURE_LLM_CLASSIFIER:-}" = "1" ] && [ "$codex_hooks_enabled" != "true" ]; then
+    err "Classifier opt-in requires managed Codex lifecycle hooks; existing hook configuration is incompatible"
+    return 1
   fi
   if [ "$codex_hooks_enabled" = "true" ]; then
     # UserPromptSubmit is registered only when OUR hook is actually on disk.
@@ -786,6 +852,22 @@ type = "command"
 command = "${esc_status}"
 TOML
 )${directive_hook_block}"
+    if [ "${WEAVE_CAPTURE_LLM_CLASSIFIER:-}" = "1" ]; then
+      hook_block="${hook_block}$(cat <<TOML
+
+[[hooks.PreToolUse]]
+matcher = "spawn_agent"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "${esc_status}"
+
+[[hooks.PreCompact]]
+[[hooks.PreCompact.hooks]]
+type = "command"
+command = "${esc_status}"
+TOML
+)"
+    fi
   fi
   local block
   block="$(cat <<TOML
@@ -805,7 +887,10 @@ ${headers_line}
 ${hook_block}
 ${WEAVE_CODEX_END_MARKER}
 TOML
-)"
+  )"
+  local codex_insertion="$block"
+  [ -z "$codex_effort_line" ] || codex_insertion="${codex_effort_line}"$'\n'"${codex_insertion}"
+  [ -z "$codex_model_line" ] || codex_insertion="${codex_model_line}"$'\n'"${codex_insertion}"
 
   if [ -f "$config_file" ]; then
     local tmp; tmp="$(mktemp -t weave-codex.XXXXXX)"
@@ -825,10 +910,11 @@ TOML
     # refused to start with "duplicate key" while the installer reported
     # success.
     awk -v begin="$WEAVE_CODEX_BEGIN_MARKER" -v end="$WEAVE_CODEX_END_MARKER" '
-      $0 == begin { skip = 1; next }
-      $0 == end   { skip = 0; next }
+      $0 == begin { skip = 1; after_managed = 0; next }
+      $0 == end   { skip = 0; after_managed = 1; next }
       skip        { next }
       /^[[:space:]]*\[/ {
+        after_managed = 0
         in_section = 1
         if ($0 ~ /^[[:space:]]*\[[[:space:]]*model_providers[[:space:]]*\.[[:space:]]*weave[[:space:]]*(\.[^]]*)?\][[:space:]]*(#.*)?$/) {
           in_weave_provider = 1
@@ -837,6 +923,9 @@ TOML
         in_weave_provider = 0
       }
       in_weave_provider { next }
+      after_managed && /^[[:space:]]*(model|model_reasoning_effort)[[:space:]]*=/ { next }
+      !in_section && /^[[:space:]]*#[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave".*weave-router: off/ { next }
+      !in_section && /^[[:space:]]*#[[:space:]]*model[[:space:]]*=[[:space:]]*"weave-auto".*weave-router: off/ { next }
       !in_section && /^[[:space:]]*model_provider[[:space:]]*=/ { next }
       { print }
     ' "$config_file" >"$tmp"
@@ -872,7 +961,7 @@ EOF
         if [ "$first_section" -gt 1 ]; then
           head -n "$((first_section - 1))" "$tmp"
         fi
-        printf "%s\n" "$block"
+        printf "%s\n" "$codex_insertion"
         tail -n "+${first_section}" "$tmp"
       } >"$config_file"
     else
@@ -880,11 +969,11 @@ EOF
       # already at top-level. Our block ends with its own [section], so
       # appending is safe (no bare keys follow).
       cp "$tmp" "$config_file"
-      printf "\n%s\n" "$block" >>"$config_file"
+      printf "\n%s\n" "$codex_insertion" >>"$config_file"
     fi
     rm -f "$tmp"
   else
-    printf "%s\n" "$block" >"$config_file"
+    printf "%s\n" "$codex_insertion" >"$config_file"
   fi
 
   # If the user already has a [features] table, place our managed hook
@@ -1021,19 +1110,20 @@ write_opencode_config() {
   # config; ChatGPT tokens live in opencode's own auth store), so 644 is fine.
   # Source is bundled alongside install.sh by the npm prepack
   # (scripts/copy-installer.js), same as commands/ + pi-router/.
-  local plugin_dir plugin_spec plugin_src plugin_arg=""
+  local plugin_dir plugin_spec plugin_src plugin_directives_src plugin_classifier_src plugin_arg=""
   plugin_dir="$(cd "$(dirname "$config_file")" && pwd)/.weave"
   plugin_spec="$plugin_dir/opencode-weave.ts"
   plugin_src="$script_dir/opencode-weave/src/index.ts"
   plugin_directives_src="$script_dir/opencode-weave/src/directives.ts"
-  if [ -f "$plugin_src" ]; then
+  plugin_classifier_src="$script_dir/opencode-weave/src/classifier-thread.ts"
+  if [ -f "$plugin_src" ] && [ -f "$plugin_directives_src" ] && [ -f "$plugin_classifier_src" ]; then
     mkdir -p "$plugin_dir"
     cp "$plugin_src" "$plugin_spec"
     chmod 644 "$plugin_spec"
-    if [ -f "$plugin_directives_src" ]; then
-      cp "$plugin_directives_src" "$plugin_dir/directives.ts"
-      chmod 644 "$plugin_dir/directives.ts"
-    fi
+    cp "$plugin_directives_src" "$plugin_dir/directives.ts"
+    chmod 644 "$plugin_dir/directives.ts"
+    cp "$plugin_classifier_src" "$plugin_dir/classifier-thread.ts"
+    chmod 644 "$plugin_dir/classifier-thread.ts"
     plugin_arg="$plugin_spec"
   else
     warn "opencode subscription plugin source not found at $plugin_src — skipping the Claude login + subscription routing. (Use a packaged 'npx $npm_package_name' install.)"
@@ -1171,14 +1261,18 @@ write_pi_models_config() {
       models: [
         { id: "claude-fable-5-1",  name: "Claude Fable 5.1 (via Weave Router)",  reasoning: true, input: ["text","image"], contextWindow: 1000000, maxTokens: 128000 },
         { id: "claude-fable-5",    name: "Claude Fable 5 (via Weave Router)",    reasoning: true, input: ["text","image"], contextWindow: 1000000, maxTokens: 128000 },
+        { id: "claude-opus-5-5",   name: "Claude Opus 5.5 (via Weave Router)",   reasoning: true, input: ["text","image"], contextWindow: 1000000, maxTokens: 128000 },
         { id: "claude-opus-5",     name: "Claude Opus 5 (via Weave Router)",     reasoning: true, input: ["text","image"], contextWindow: 1000000, maxTokens: 128000 },
         { id: "claude-opus-4-7",   name: "Claude Opus 4.7 (via Weave Router)",   reasoning: true, input: ["text","image"], contextWindow: 1000000, maxTokens: 64000 },
         { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6 (via Weave Router)", reasoning: true, input: ["text","image"], contextWindow: 1000000, maxTokens: 64000 },
         { id: "claude-haiku-4-5",  name: "Claude Haiku 4.5 (via Weave Router)",  reasoning: true, input: ["text","image"], contextWindow: 200000, maxTokens: 32000 },
         { id: "gpt-6-astra",       name: "GPT-6 Astra (via Weave Router)",       reasoning: true, input: ["text","image"], contextWindow: 1050000, maxTokens: 128000 },
+        { id: "gpt-6-sol",         name: "GPT-6 Sol (via Weave Router)",         reasoning: true, input: ["text","image"], contextWindow: 1050000, maxTokens: 128000 },
+        { id: "gpt-6-luna",        name: "GPT-6 Luna (via Weave Router)",        reasoning: true, input: ["text","image"], contextWindow: 1050000, maxTokens: 128000 },
         { id: "gpt-5.6-sol",       name: "GPT-5.6 Sol (via Weave Router)",       reasoning: true, input: ["text","image"], contextWindow: 1050000, maxTokens: 128000 },
         { id: "grok-4.5",          name: "Grok 4.5 (via Weave Router)",          reasoning: true, input: ["text","image"], contextWindow: 500000, maxTokens: 131072 },
-        { id: "grok-4.6",          name: "Grok 4.6 (via Weave Router)",          reasoning: true, input: ["text","image"], contextWindow: 500000, maxTokens: 131072 }
+        { id: "grok-4.6",          name: "Grok 4.6 (via Weave Router)",          reasoning: true, input: ["text","image"], contextWindow: 500000, maxTokens: 131072 },
+        { id: "grok-4.7",          name: "Grok 4.7 (via Weave Router)",          reasoning: true, input: ["text","image"], contextWindow: 500000, maxTokens: 131072 }
       ]
     }
   ')"
@@ -1390,6 +1484,14 @@ while [ $# -gt 0 ]; do
       [ -n "$email" ] || { err "--email requires a value."; exit 2; }
       email_explicit="true"
       ;;
+    --return-url)
+      return_url="${2:-}"; shift 2
+      [ -n "$return_url" ] || { err "--return-url requires a value."; exit 2; }
+      case "$return_url" in
+        http://*|https://*) ;;
+        *) err "--return-url must be an http:// or https:// URL."; exit 2 ;;
+      esac
+      ;;
     --local)
       # Shorthand for local dev: localhost:8080 (matches `wv mr` / `make dev` default PORT).
       base_url="http://localhost:8080"
@@ -1503,12 +1605,22 @@ if [ "$mode" = "setup" ]; then
   [ "$non_interactive" = "true" ] && setup_args+=(--non-interactive)
   [ "$base_url_explicit" = "true" ] && setup_args+=(--base-url "$base_url")
   [ "$email_explicit" = "true" ] && setup_args+=(--email "$email")
+  if [ -n "$return_url" ] && [ "$setup_claude" = "true" ] && [ "$setup_codex" = "true" ]; then
+    err "--return-url with setup requires a single target: use setup --claude or setup --codex."
+    exit 2
+  fi
+  [ -n "$return_url" ] && setup_args+=(--return-url "$return_url")
   [ -n "$install_dir" ] && setup_args+=(--dir "$install_dir")
   [ "$quiet" = "true" ] && setup_args+=(--quiet)
   [ "$rotate_key" = "true" ] && setup_args+=(--rotate-key)
   [ "$setup_claude" = "true" ] && bash "$0" "${setup_args[@]}" --claude
   [ "$setup_codex" = "true" ] && bash "$0" "${setup_args[@]}" --codex
   exit 0
+fi
+
+if [ -n "$return_url" ] && [ "$mode" != "install" ]; then
+  err "--return-url is supported only for install (or setup with one explicit target)."
+  exit 2
 fi
 
 # --lsp is a pi-extension feature, so it implies the pi target; combining it
@@ -1640,10 +1752,12 @@ fi
 
 # ---------- interactive scope prompt ----------
 
-# If the user didn't pass --scope and we have a controlling terminal, ask which
-# scope to install into. Non-interactive runs (CI, `curl | sh --non-interactive`)
+# If the user is installing and didn't pass --scope, ask which scope to write
+# into. Account, status, and model commands only read an existing install, so
+# they keep the user-scope default unless the caller explicitly selects a
+# project scope. Non-interactive installs (CI, `curl | sh --non-interactive`)
 # silently use the "user" default.
-if [ -z "$install_dir" ] && [ "$scope_explicit" = "false" ] && [ "$non_interactive" = "false" ] && [ -r /dev/tty ]; then
+if [ "$mode" = "install" ] && [ -z "$install_dir" ] && [ "$scope_explicit" = "false" ] && [ "$non_interactive" = "false" ] && [ -r /dev/tty ]; then
   # Per-target paths so the prompt text matches what actually gets written.
   case "$target" in
     codex)
@@ -2458,8 +2572,7 @@ prepare_claude_context_window() {
   if [ "$scope" = "project" ] && [ -z "$install_dir" ]; then
     context_settings_file="$local_settings_file"
   fi
-  context_state_file="$settings_dir/.weave-context-window.json"
-  refuse_if_symlink "$context_state_file"
+  refuse_if_symlink "$settings_dir/.weave-context-window.json"
   [ -n "$context_window" ] || return 0
 
   local source model="" disabled="${CLAUDE_CODE_DISABLE_1M_CONTEXT:-}" env_model="${ANTHROPIC_MODEL:-}"
@@ -2481,7 +2594,7 @@ prepare_claude_context_window() {
   model="${model:-sonnet}"
   case "$model" in
     *'[1m]') context_window=""; return 0 ;;
-    sonnet|opus|fable|claude-sonnet-4-6|claude-sonnet-5|claude-opus-4-6|claude-opus-4-7|claude-opus-4-8|claude-opus-5|claude-fable-5|claude-fable-5-1) ;;
+    sonnet|opus|fable|claude-sonnet-4-6|claude-sonnet-5|claude-opus-4-6|claude-opus-4-7|claude-opus-4-8|claude-opus-5|claude-opus-5-5|claude-fable-5|claude-fable-5-1) ;;
     *) err "Cannot assert 1M support for '$model'. Select a supported Sonnet/Opus/Fable model first; leaving it unchanged."; return 1 ;;
   esac
   context_managed_model="${model}[1m]"
@@ -2491,7 +2604,7 @@ apply_claude_context_window() {
   local action="$1" active="$2" state="$settings_dir/.weave-context-window.json" merged tmp
   refuse_if_symlink "$state"
   [ -f "$active" ] || return 0
-  if [ "$action" = "install" ] && [ -n "$context_window" ]; then
+  if [ -n "$context_window" ]; then
     tmp="$(mktemp "$settings_dir/.weave-context.XXXXXX")"
     jq --arg managed "$context_managed_model" '{had_model: has("model"), original: .model, managed: $managed}' "$active" >"$tmp"
     chmod 600 "$tmp"
@@ -2499,13 +2612,13 @@ apply_claude_context_window() {
     merged="$(jq --arg model "$context_managed_model" '.model = $model' "$active")"
   else
     [ -f "$state" ] || return 0
-    merged="$(jq --slurpfile state "$state" --arg action "$action" '
+    merged="$(jq --slurpfile state "$state" --arg action "$action" --arg context_window "$context_window" '
       $state[0] as $s |
       if $action == "off" then
         if .model == $s.managed then
           if $s.had_model then .model = $s.original else del(.model) end
         else . end
-      elif has("model") == $s.had_model and .model == $s.original then .model = $s.managed
+      elif ($action == "install" or $action == "on") and has("model") == $s.had_model and .model == $s.original then .model = $s.managed
       else . end
     ' "$active")"
   fi
@@ -2513,7 +2626,7 @@ apply_claude_context_window() {
   printf '%s\n' "$merged" >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$active"
-  if [ "$action" = "install" ] && [ -n "$context_window" ]; then
+  if [ -n "$context_window" ]; then
     ok "Claude Code model set to $context_managed_model; automatic compaction stays enabled. Restart Claude Code."
     if [ "$scope" = "project" ] && [ -z "$install_dir" ]; then
       gitignore_add ".claude/.weave-context-window.json"
@@ -2680,12 +2793,16 @@ toggle_claude() {
 toggle_codex() {
   local f="$codex_config_file" state="absent" tmp
   if [ -f "$f" ]; then
-    state="$(awk -v b="$WEAVE_CODEX_BEGIN_MARKER" -v e="$WEAVE_CODEX_END_MARKER" '
-      $0==b{inblk=1; next}
-      $0==e{inblk=0; next}
-      inblk && /^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave"/ {st="on"}
-      inblk && /^[[:space:]]*#[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave"/ {if(st=="")st="off"}
-      END{print (st==""?"absent":st)}
+    state="$(awk '
+      /^[[:space:]]*\[[[:space:]]*model_providers[[:space:]]*\.[[:space:]]*weave[[:space:]]*\]/ { has_weave = 1 }
+      /^[[:space:]]*\[/ { in_section = 1 }
+      !in_section && /^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave"[[:space:]]*$/ { active_weave = 1 }
+      !in_section && /^[[:space:]]*model_provider[[:space:]]*=/ { has_active_provider = 1 }
+      END {
+        if (!has_weave) print "absent"
+        else if (active_weave) print "on"
+        else print (has_active_provider ? "absent" : "off")
+      }
     ' "$f")"
   fi
 
@@ -2701,10 +2818,12 @@ toggle_codex() {
       if [ "$state" = "absent" ]; then info "Codex isn't configured for the router. Run the installer first."; return 0; fi
       if [ "$state" = "off" ]; then ok "Codex is already off — nothing to do."; return 0; fi
       tmp="$(mktemp -t weave-codex-toggle.XXXXXX)"
-      awk -v b="$WEAVE_CODEX_BEGIN_MARKER" -v e="$WEAVE_CODEX_END_MARKER" '
-        $0==b{inblk=1; print; next}
-        $0==e{inblk=0; print; next}
-        inblk && /^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave"[[:space:]]*$/ {
+      awk '
+        /^[[:space:]]*\[/ { in_section = 1 }
+        !in_section && /^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave"[[:space:]]*$/ {
+          print "# " $0 "  # weave-router: off (run on to re-enable)"; next
+        }
+        !in_section && /^[[:space:]]*model[[:space:]]*=[[:space:]]*"weave-auto"[[:space:]]*$/ {
           print "# " $0 "  # weave-router: off (run on to re-enable)"; next
         }
         {print}
@@ -2719,13 +2838,39 @@ toggle_codex() {
       if [ "$state" = "absent" ]; then warn "No managed Weave block in $f. Run the installer to set up Codex."; return 0; fi
       if [ "$state" = "on" ]; then ok "Codex is already on — nothing to do."; return 0; fi
       tmp="$(mktemp -t weave-codex-toggle.XXXXXX)"
-      awk -v b="$WEAVE_CODEX_BEGIN_MARKER" -v e="$WEAVE_CODEX_END_MARKER" '
-        $0==b{inblk=1; print; next}
-        $0==e{inblk=0; print; next}
-        inblk && /^[[:space:]]*#[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave"/ {
-          print "model_provider = \"weave\""; next
+      local has_top_model="false"
+      if awk '
+        /^[[:space:]]*\[/ { in_section = 1 }
+        !in_section && /^[[:space:]]*model[[:space:]]*=/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+      ' "$f"; then
+        has_top_model="true"
+      fi
+      awk -v has_top_model="$has_top_model" '
+        function add_missing_settings() {
+          if (!restored_provider) print "model_provider = \"weave\""
+          if (has_top_model != "true" && !restored_model) print "model = \"weave-auto\""
+        }
+        /^[[:space:]]*\[/ {
+          if (!in_section) add_missing_settings()
+          in_section = 1
+        }
+        !in_section && /^[[:space:]]*#[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave".*weave-router: off/ {
+          if (!restored_provider) {
+            print "model_provider = \"weave\""
+            restored_provider = 1
+          }
+          next
+        }
+        !in_section && /^[[:space:]]*#[[:space:]]*model[[:space:]]*=[[:space:]]*"weave-auto".*weave-router: off/ {
+          if (has_top_model != "true" && !restored_model) {
+            print "model = \"weave-auto\""
+            restored_model = 1
+          }
+          next
         }
         {print}
+        END { if (!in_section) add_missing_settings() }
       ' "$f" >"$tmp" && mv "$tmp" "$f"
       chmod 600 "$f"
       if [ -f "$codex_status_file" ] && grep -Fq '<!-- weave-router managed codex status -->' "$codex_status_file"; then
@@ -3156,7 +3301,7 @@ run_accounts() {
       if [ "$models_json" = "true" ]; then
         printf '%s\n' "$models_http_body"
       else
-        printf '%s\n' "$models_http_body" | jq -r '.[] | "\(.id)\t\(.provider)\t\(.external_account_id)\t\(if .enabled then "enabled" else "disabled" end)\t\(if .cooldown_until then "cooldown until " + .cooldown_until else "ready" end)"'
+        printf '%s\n' "$models_http_body" | jq -r '.[] | "\(.id)\t\(.provider)\t\(.external_account_id)" + (if (.display_name // "") != "" then "\t" + .display_name else "" end) + "\t" + (if .enabled then "enabled" else "disabled" end) + "\t" + (if .cooldown_until then "cooldown until " + .cooldown_until else "ready" end)'
       fi
       ;;
     disable|remove)
@@ -3182,6 +3327,47 @@ oauth_base64url() {
   openssl base64 -A | tr '+/' '-_' | tr -d '='
 }
 
+# open_url_in_browser asks the operating system to open a URL with the user's
+# default browser. Keep this best-effort: a successful install must not be
+# rolled back just because a headless shell has no browser opener available.
+open_url_in_browser() {
+  local url="$1" os
+  os="$(uname -s 2>/dev/null || printf '')"
+  case "$os" in
+    Darwin*)
+      command -v open >/dev/null 2>&1 || return 1
+      open "$url" >/dev/null 2>&1
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      # explorer.exe is a direct process launch; cmd.exe /c start would parse
+      # URL query separators such as '&' as shell syntax. Its exit status is
+      # not meaningful: an already-running shell commonly returns 1 after
+      # handing the URL off.
+      command -v explorer.exe >/dev/null 2>&1 || return 1
+      explorer.exe "$url" >/dev/null 2>&1 || true
+      return 0
+      ;;
+    *)
+      command -v xdg-open >/dev/null 2>&1 || return 1
+      xdg-open "$url" >/dev/null 2>&1
+      ;;
+  esac
+}
+
+open_return_url_if_verified() {
+  [ "$mode" = "install" ] || return 0
+  [ -n "$return_url" ] || return 0
+  if [ "${install_verification_succeeded:-false}" != "true" ]; then
+    warn "Skipping return URL because router verification did not complete successfully."
+    return 0
+  fi
+  if open_url_in_browser "$return_url"; then
+    info "Opened return URL in your browser: $return_url"
+  else
+    warn "Install succeeded, but no default-browser opener was available. Open this URL to continue: $return_url"
+  fi
+}
+
 open_oauth_url() {
   local url="$1"
   if command -v open >/dev/null 2>&1; then
@@ -3199,6 +3385,24 @@ jwt_account_id() {
   while [ "$padding" -gt 0 ]; do payload="${payload}="; padding=$((padding - 1)); done
   decoded="$(printf '%s' "$payload" | base64 --decode 2>/dev/null || printf '%s' "$payload" | base64 -D 2>/dev/null || true)"
   printf '%s' "$decoded" | jq -r '.chatgpt_account_id // .["https://api.openai.com/auth"].chatgpt_account_id // .organizations[0].id // empty' 2>/dev/null || true
+}
+
+jwt_account_label() {
+  local token="$1" payload padding decoded
+  payload="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+  padding=$(( (4 - ${#payload} % 4) % 4 ))
+  while [ "$padding" -gt 0 ]; do payload="${payload}="; padding=$((padding - 1)); done
+  decoded="$(printf '%s' "$payload" | base64 --decode 2>/dev/null || printf '%s' "$payload" | base64 -D 2>/dev/null || true)"
+  printf '%s' "$decoded" | jq -r '
+    def clean: if type == "string" then gsub("[[:cntrl:]]"; " ") | gsub("[[:space:]]+"; " ") | sub("^ +"; "") | sub(" +$"; "") else "" end;
+    (.organizations[0].name // .organizations[0].display_name // .organization.name // "" | clean) as $organization |
+    (.email // .email_address // .["https://api.openai.com/profile"].email // .["https://api.openai.com/auth"].email // "" | clean) as $email |
+    (.name // .preferred_username // "" | clean) as $name |
+    if $organization != "" and $email != "" then ($organization + ": " + $email)
+    elif $email != "" then $email
+    elif $organization != "" then $organization
+    else $name end
+  ' 2>/dev/null || true
 }
 
 # OAuth issuers rate-limit curl's default user agent, which fails the token
@@ -3229,7 +3433,7 @@ oauth_post_form() {
 }
 
 run_login_claude() {
-  local verifier challenge expected_state authorize_endpoint authorize_url pasted_code auth_code returned_state token_response refresh_token external_account_id body
+  local verifier challenge expected_state authorize_endpoint authorize_url pasted_code auth_code returned_state token_response refresh_token account_uuid organization_uuid account_email organization_name display_name external_account_id body
   verifier="$(openssl rand 32 | oauth_base64url)"
   challenge="$(printf '%s' "$verifier" | openssl dgst -sha256 -binary | oauth_base64url)"
   expected_state="$(openssl rand 32 | oauth_base64url)"
@@ -3251,14 +3455,27 @@ run_login_claude() {
     || { err "Claude token exchange failed."; exit 1; }
   refresh_token="$(printf '%s' "$token_response" | jq -r '.refresh_token // empty')"
   [ -n "$refresh_token" ] || { err "Claude token exchange returned no refresh token."; exit 1; }
-  external_account_id="claude-$(openssl rand 12 | oauth_base64url)"
-  body="$(jq -nc --arg provider claude --arg account "$external_account_id" --arg token "$refresh_token" '{provider:$provider,external_account_id:$account,refresh_token:$token}')"
+  account_uuid="$(printf '%s' "$token_response" | jq -er '.account.uuid | select(type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) | ascii_downcase' 2>/dev/null)" \
+    || { err "Claude token exchange returned no valid account UUID; subscription was not enrolled. Update the installer and try again."; exit 1; }
+  organization_uuid="$(printf '%s' "$token_response" | jq -er '.organization.uuid | select(type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) | ascii_downcase' 2>/dev/null)" \
+    || { err "Claude token exchange returned no valid organization UUID; subscription was not enrolled. Update the installer and try again."; exit 1; }
+  account_email="$(printf '%s' "$token_response" | jq -r '.account.email_address // .account.email // empty' 2>/dev/null || true)"
+  organization_name="$(printf '%s' "$token_response" | jq -r '.organization.name // .organization.display_name // empty' 2>/dev/null || true)"
+  display_name="$(jq -nr --arg organization "$organization_name" --arg email "$account_email" '
+    def clean: gsub("[[:cntrl:]]"; " ") | gsub("[[:space:]]+"; " ") | sub("^ +"; "") | sub(" +$"; "");
+    ($organization | clean) as $organization | ($email | clean) as $email |
+    if $organization != "" and $email != "" then ($organization + ": " + $email)
+    elif $email != "" then $email
+    else $organization end
+  ')"
+  external_account_id="${account_uuid}:${organization_uuid}"
+  body="$(jq -nc --arg provider claude --arg account "$external_account_id" --arg token "$refresh_token" --arg label "$display_name" '{provider:$provider,external_account_id:$account,refresh_token:$token} | if $label != "" then .display_name = $label else . end')"
   models_api POST "/v1/subscriptions/accounts" "$body" || models_fail "enrolling Claude subscription"
   ok "Claude subscription enrolled."
 }
 
 run_login_codex() {
-  local issuer device_response device_auth_id user_code interval authorization_response authorization_code verifier token_response refresh_token account_id body attempts token_form
+  local issuer device_response device_auth_id user_code interval authorization_response authorization_code verifier token_response refresh_token account_id display_name identity_token body attempts token_form
   issuer="${WEAVE_CODEX_OAUTH_ISSUER:-https://auth.openai.com}"
   device_response="$(oauth_post_json "$issuer/api/accounts/deviceauth/usercode" '{"client_id":"app_EMoamEEZ73f0CkXaXp7hrann"}')" \
     || { err "Could not start Codex device authorization."; exit 1; }
@@ -3291,12 +3508,14 @@ run_login_codex() {
   token_response="$(oauth_post_form "$issuer/oauth/token" "$token_form")" \
     || { err "Codex token exchange failed."; exit 1; }
   refresh_token="$(printf '%s' "$token_response" | jq -r '.refresh_token // empty')"
-  account_id="$(jwt_account_id "$(printf '%s' "$token_response" | jq -r '.id_token // .access_token // empty')")"
+  identity_token="$(printf '%s' "$token_response" | jq -r '.id_token // .access_token // empty')"
+  account_id="$(jwt_account_id "$identity_token")"
+  display_name="$(jwt_account_label "$identity_token")"
   if [ -z "$refresh_token" ] || [ -z "$account_id" ]; then
     err "Codex token exchange omitted account identity or refresh credentials."
     exit 1
   fi
-  body="$(jq -nc --arg provider codex --arg account "$account_id" --arg token "$refresh_token" '{provider:$provider,external_account_id:$account,refresh_token:$token}')"
+  body="$(jq -nc --arg provider codex --arg account "$account_id" --arg token "$refresh_token" --arg label "$display_name" '{provider:$provider,external_account_id:$account,refresh_token:$token} | if $label != "" then .display_name = $label else . end')"
   models_api POST "/v1/subscriptions/accounts" "$body" || models_fail "enrolling Codex subscription"
   ok "Codex subscription enrolled."
 }
@@ -3348,7 +3567,7 @@ run_router_status() {
     if [ "$(printf '%s' "$models_http_body" | jq 'length')" -eq 0 ]; then
       printf '  none enrolled\n'
     else
-      printf '%s\n' "$models_http_body" | jq -r '.[] | "  " + .provider + "  " + .external_account_id + "  " + (if .enabled then "enabled" else "disabled" end) + (if .cooldown_until then "  cooldown until " + .cooldown_until else "  ready" end)'
+      printf '%s\n' "$models_http_body" | jq -r '.[] | "  " + .provider + "  " + .external_account_id + (if (.display_name // "") != "" then "  [" + .display_name + "]" else "" end) + "  " + (if .enabled then "enabled" else "disabled" end) + (if .cooldown_until then "  cooldown until " + .cooldown_until else "  ready" end)'
     fi
   elif [ "$models_http_status" = "404" ]; then
     printf 'Subscription accounts: server-side pools disabled\n'
@@ -3874,15 +4093,25 @@ rewrite_installed_key() {
 }
 
 verify_install() {
-  if [ "$quiet" != "true" ]; then
-    if ! spin "Pinging $base_url/health" curl -fsS --max-time 5 "$base_url/health"; then
+  local health_verified="false"
+  install_verification_succeeded="false"
+
+  # --quiet normally skips the health probe, but a return URL is only safe to
+  # open after both probes have actually run and passed.
+  if [ "$quiet" != "true" ] || [ -n "$return_url" ]; then
+    if spin "Pinging $base_url/health" curl -fsS --max-time 5 "$base_url/health"; then
+      health_verified="true"
+    else
       warn "Could not reach $base_url/health within 5s. Settings are written; verify the router is running."
     fi
   fi
 
   [ -n "$api_key" ] || return 0
 
-  spin "Validating API key" validate_key && return 0
+  if spin "Validating API key" validate_key; then
+    [ "$health_verified" = "true" ] && install_verification_succeeded="true"
+    return 0
+  fi
 
   # A key we read back off disk can have been revoked or rotated since it was
   # installed, and reusing it silently would leave a broken install behind
@@ -3895,7 +4124,9 @@ verify_install() {
     warn "The router key already installed was rejected (revoked or rotated)."
     prompt_for_key
     rewrite_installed_key "$api_key"
-    if ! spin "Validating API key" validate_key; then
+    if spin "Validating API key" validate_key; then
+      [ "$health_verified" = "true" ] && install_verification_succeeded="true"
+    else
       warn "Router rejected the API key (check it matches the dashboard at $base_url)."
     fi
     return 0
@@ -3930,6 +4161,7 @@ announce_done() {
   fi
   printf "%s✓%s %s%sWeave Router installed for %s.%s\n" \
     "$C_GREEN" "$C_RESET" "$C_BOLD" "$C_BRAND" "$1" "$C_RESET"
+  open_return_url_if_verified
 }
 
 # ---------- codex install path (dispatch + exit before the Claude-only writes) ----------
@@ -4021,6 +4253,9 @@ set -euo pipefail
 # WEAVE_STATUSLINE_UPDATE and WEAVE_STATUSLINE_UPDATE_INTERVAL_DAYS variables
 # remain accepted as aliases for users who configure both clients together.
 weave_self_refresh() {
+  # The published helper may predate classifier lifecycle forwarding. Do not
+  # replace the hook implementation underneath an opted-in session.
+  [ "${WEAVE_CAPTURE_LLM_CLASSIFIER:-}" = "1" ] && return 0
   [ "${WEAVE_CODEX_STATUS_UPDATE:-${WEAVE_STATUSLINE_UPDATE:-1}}" = "0" ] && return 0
   command -v curl >/dev/null 2>&1 || return 0
 
@@ -4087,9 +4322,10 @@ emit_title() {
   local title="$1"
   if [ -n "${WEAVE_CODEX_STATUS_TITLE_FILE:-}" ]; then
     printf '%s\n' "$title" >"$WEAVE_CODEX_STATUS_TITLE_FILE"
-  elif [ -w /dev/tty ]; then
+  elif [ -t 2 ] && [ -w /dev/tty ]; then
     printf '\033]0;%s\007' "$title" >/dev/tty
   fi
+  return 0
 }
 
 safe_session_id() {
@@ -4317,12 +4553,31 @@ command -v jq >/dev/null 2>&1 || exit 0
 jq -e . >/dev/null 2>&1 <<<"$payload" || exit 0
 
 hook_event_name="$(jq -r '.hook_event_name // ""' <<<"$payload")"
+if [ "${WEAVE_CAPTURE_LLM_CLASSIFIER:-}" = "1" ] && [ -n "${WEAVE_CAPTURE_HOOK_TOKEN:-}" ]; then
+  classifier_hook_url="${WEAVE_CAPTURE_HOOK_URL:-http://127.0.0.1:41984/classifier/hook}"
+  if [[ "$classifier_hook_url" =~ ^http://(127\.0\.0\.1|localhost|\[::1\]):[0-9]+/classifier/hook$ ]]; then
+  case "$hook_event_name" in
+    SessionStart|PreToolUse|PreCompact)
+      # Send lifecycle identifiers only. A failed hook cannot enroll a thread;
+      # the opted-in capture proxy rejects its inference request instead.
+      jq -c '{hook_event_name,session_id,source,tool_name}' <<<"$payload" |
+        curl -fsS --max-time 2 -H 'Content-Type: application/json' \
+          -H "X-Weave-Capture-Hook-Token: $WEAVE_CAPTURE_HOOK_TOKEN" \
+          --data-binary @- "$classifier_hook_url" >/dev/null 2>&1 || true
+      ;;
+  esac
+  fi
+fi
 if [ "$hook_event_name" = "SessionStart" ]; then
   if [ -f "$disabled_marker" ]; then
     emit_title "Codex · direct"
   else
     emit_title "Weave Router · active"
   fi
+  exit 0
+fi
+
+if [ "$hook_event_name" = "PreToolUse" ] || [ "$hook_event_name" = "PreCompact" ]; then
   exit 0
 fi
 
@@ -4746,8 +5001,7 @@ if [ "$target" = "opencode" ]; then
     for entry in \
       "opencode.json" \
       ".weave/" \
-      ".weave-parked.json" \
-      ".opencode/commands/*.weave-router"
+      ".weave-parked.json"
     do
       if [ ! -f "$gitignore" ] || ! grep -qxF "$entry" "$gitignore"; then
         printf '%s\n' "$entry" >>"$gitignore"
@@ -5332,12 +5586,14 @@ prices='{
     "claude-opus-4-7":                  0.005,
     "claude-opus-4-8":                  0.005,
     "claude-opus-5":                    0.005,
+    "claude-opus-5-5":                  0.004,
     "claude-sonnet-4-5":                0.003,
     "claude-sonnet-4-6":                0.003,
     "claude-sonnet-5":                  0.003,
     "deepseek/deepseek-v4-flash":       0.0001134,
     "deepseek/deepseek-v4-pro":         0.00174,
     "deepseek/deepseek-v4-pro-0813":    0.00174,
+    "deepseek/deepseek-v4.1-flash":     0.00022,
     "gemini-2.0-flash":                 0.0001,
     "gemini-2.0-flash-lite":            0.000075,
     "gemini-2.5-flash":                 0.0003,
@@ -5376,8 +5632,12 @@ prices='{
     "gpt-5.6-sol-pro":                  0.004,
     "gpt-5.6-terra":                    0.002,
     "gpt-6-astra":                      0.01,
+    "gpt-6-luna":                       0.0001,
+    "gpt-6-sol":                        0.002,
     "grok-4.5":                         0.002,
     "grok-4.6":                         0.002,
+    "grok-4.7":                         0.002,
+    "inclusionai/ling-3.0-flash":       0.00006,
     "minimax/minimax-m2.7":             0.0003,
     "minimax/minimax-m3":               0.0003,
     "mistralai/mistral-small-2603":     0.0002,
@@ -5396,6 +5656,8 @@ prices='{
     "qwen/qwen3.7-plus":                0.0004,
     "qwen/qwen3.8-max":                 0.002,
     "xiaomi/mimo-v2.5-pro":             0.001,
+    "xiaomi/mimo-v2.6-flash":           0.00014,
+    "xiaomi/mimo-v2.6-pro":             0.000435,
     "z-ai/glm-5":                       0.001,
     "z-ai/glm-5.1":                     0.0014,
     "z-ai/glm-5.2":                     0.0014,
@@ -5413,12 +5675,14 @@ prices='{
     "claude-opus-4-7":                  0.025,
     "claude-opus-4-8":                  0.025,
     "claude-opus-5":                    0.025,
+    "claude-opus-5-5":                  0.02,
     "claude-sonnet-4-5":                0.015,
     "claude-sonnet-4-6":                0.015,
     "claude-sonnet-5":                  0.015,
     "deepseek/deepseek-v4-flash":       0.0002791,
     "deepseek/deepseek-v4-pro":         0.00348,
     "deepseek/deepseek-v4-pro-0813":    0.00348,
+    "deepseek/deepseek-v4.1-flash":     0.00066,
     "gemini-2.0-flash":                 0.0004,
     "gemini-2.0-flash-lite":            0.0003,
     "gemini-2.5-flash":                 0.0012,
@@ -5457,8 +5721,12 @@ prices='{
     "gpt-5.6-sol-pro":                  0.02,
     "gpt-5.6-terra":                    0.012,
     "gpt-6-astra":                      0.05,
+    "gpt-6-luna":                       0.0005,
+    "gpt-6-sol":                        0.01,
     "grok-4.5":                         0.006,
     "grok-4.6":                         0.006,
+    "grok-4.7":                         0.006,
+    "inclusionai/ling-3.0-flash":       0.00018,
     "minimax/minimax-m2.7":             0.0012,
     "minimax/minimax-m3":               0.0012,
     "mistralai/mistral-small-2603":     0.0006,
@@ -5477,6 +5745,8 @@ prices='{
     "qwen/qwen3.7-plus":                0.0016,
     "qwen/qwen3.8-max":                 0.006,
     "xiaomi/mimo-v2.5-pro":             0.003,
+    "xiaomi/mimo-v2.6-flash":           0.00028,
+    "xiaomi/mimo-v2.6-pro":             0.00087,
     "z-ai/glm-5":                       0.0032,
     "z-ai/glm-5.1":                     0.0044,
     "z-ai/glm-5.2":                     0.0044,
@@ -5494,12 +5764,14 @@ prices='{
     "claude-opus-4-7":                  0.1,
     "claude-opus-4-8":                  0.1,
     "claude-opus-5":                    0.1,
+    "claude-opus-5-5":                  0.05,
     "claude-sonnet-4-5":                0.1,
     "claude-sonnet-4-6":                0.1,
     "claude-sonnet-5":                  0.1,
     "deepseek/deepseek-v4-flash":       0.2,
     "deepseek/deepseek-v4-pro":         0.11494252873563218,
     "deepseek/deepseek-v4-pro-0813":    0.11494252873563218,
+    "deepseek/deepseek-v4.1-flash":     0.031818181818181815,
     "gemini-2.0-flash":                 0.25,
     "gemini-2.0-flash-lite":            0.25,
     "gemini-2.5-flash":                 0.1,
@@ -5538,8 +5810,12 @@ prices='{
     "gpt-5.6-sol-pro":                  0.1,
     "gpt-5.6-terra":                    0.1,
     "gpt-6-astra":                      0.1,
+    "gpt-6-luna":                       0.1,
+    "gpt-6-sol":                        0.1,
     "grok-4.5":                         0.25,
     "grok-4.6":                         0.25,
+    "grok-4.7":                         0.25,
+    "inclusionai/ling-3.0-flash":       0.2,
     "minimax/minimax-m2.7":             0.2,
     "minimax/minimax-m3":               0.2,
     "mistralai/mistral-small-2603":     0.1,
@@ -5558,6 +5834,8 @@ prices='{
     "qwen/qwen3.7-plus":                0.2,
     "qwen/qwen3.8-max":                 0.125,
     "xiaomi/mimo-v2.5-pro":             0.1,
+    "xiaomi/mimo-v2.6-flash":           0.02,
+    "xiaomi/mimo-v2.6-pro":             0.00827586,
     "z-ai/glm-5":                       0.2,
     "z-ai/glm-5.1":                     0.18571428571428572,
     "z-ai/glm-5.2":                     0.18571428571428572,
@@ -5925,7 +6203,11 @@ write_claude_settings() {
     chmod 600 "$local_settings_file"
     ok "Router key header written to $local_settings_file"
   fi
-  apply_claude_context_window install "$context_settings_file"
+  context_window_action="install"
+  if [ "$mode" = "update" ] && [ ! -f "$settings_dir/.weave-parked.json" ]; then
+    context_window_action="update"
+  fi
+  apply_claude_context_window "$context_window_action" "$context_settings_file"
 }
 
 # write_claude_settings rewrites the full router config live, so a parked
@@ -5958,8 +6240,7 @@ if [ "$scope" = "project" ] && [ -z "$install_dir" ] && [ -n "${git_root:-}" ]; 
     ".claude/settings.local.json" \
     ".claude/.credentials.json" \
     ".claude/cc-statusline.sh" \
-    ".claude/cc-statusline.sh.weave-router" \
-    ".claude/commands/*.weave-router"
+    ".claude/cc-statusline.sh.weave-router"
   do
     [[ "$entry" == .claude/cc-statusline.sh* ]] && [ "$statusline_install" != "true" ] && continue
     if [ ! -f "$gitignore" ] || ! grep -qxF "$entry" "$gitignore"; then

@@ -126,8 +126,8 @@ var (
 	anthropicAdaptiveXhigh = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true}, CapAdaptiveThinking, CapExtendedContext, CapXhighEffort)
 	// Opus 5 / Fable 5 add server-side fallback on top of the xhigh menu.
 	anthropicAdaptiveFallback = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true}, CapAdaptiveThinking, CapExtendedContext, CapXhighEffort, CapServerSideFallback)
-	// Fable 5.1 additionally rejects tool_choice any/tool ("not supported for
-	// this model"); opus-5 and fable-5 accept them.
+	// Fable 5.1 and Opus 5.5 additionally reject tool_choice any/tool ("not
+	// supported for this model"); opus-5 and fable-5 accept them.
 	anthropicAdaptiveFallbackAutoTools = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "max", "xhigh"}, AlwaysOn: true}, CapAdaptiveThinking, CapExtendedContext, CapXhighEffort, CapServerSideFallback, CapAutoToolChoiceOnly)
 	anthropicExtended                  = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high"}, SupportsBudget: true}, CapExtendedThinking)
 )
@@ -140,8 +140,13 @@ var (
 	openai56 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
 	// GPT-6 Astra exposes max on the public Responses API and always reasons.
 	openaiAstra = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh", "max"}, SupportsBudget: true, AlwaysOn: true}, CapReasoning, CapXhighEffort)
+	// GPT-6 Sol/Luna expose Astra's menu but also accept reasoning.effort=none,
+	// so a disable passes through instead of clamping to the floor.
+	openai6 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh", "max"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
 	// grok-4.6: openaiReasoning + the extra "xhigh" level.
 	grok46 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
+	// Grok 4.7 exposes the same four reasoning effort levels as Grok 4.6.
+	grok47 = NewSpecWithReasoning(ReasoningCapabilities{Levels: []string{"low", "medium", "high", "xhigh"}, SupportsBudget: true}, CapReasoning, CapXhighEffort)
 	// museSpark: reasoning_effort minimal/low/medium/high/xhigh; "none" is a 400
 	// (always reasons), so AlwaysOn maps a disable to the floor level. The
 	// router canonicalizes "minimal" to "low" before dispatch.
@@ -160,6 +165,7 @@ var registry = map[string]ModelSpec{
 	// 1M context is native, so CapExtendedContext's beta header is a no-op.
 	"claude-fable-5":   anthropicAdaptiveFallback,
 	"claude-fable-5-1": anthropicAdaptiveFallbackAutoTools,
+	"claude-opus-5-5":  anthropicAdaptiveFallbackAutoTools,
 	"claude-opus-5":    anthropicAdaptiveFallback,
 	"claude-opus-4-8":  anthropicAdaptiveXhigh,
 	"claude-opus-4-7":  anthropicAdaptiveXhigh,
@@ -180,6 +186,8 @@ var registry = map[string]ModelSpec{
 	"claude-sonnet-4-0": NewSpec(),
 
 	"gpt-6-astra": openaiAstra,
+	"gpt-6-sol":   openai6,
+	"gpt-6-luna":  openai6,
 
 	"gpt-5.6-sol":      openai56,
 	"gpt-5.6-sol-pro":  openai56,
@@ -199,6 +207,7 @@ var registry = map[string]ModelSpec{
 	// grok-4.6: grok-4.5 added an "xhigh" effort that xAI didn't document for 4.5;
 	// xAI's 4.6 docs keep the low/medium/high/xhigh menu. CapReasoning + CapXhighEffort.
 	"grok-4.6": grok46,
+	"grok-4.7": grok47,
 
 	"muse-spark-1.3": museSpark,
 

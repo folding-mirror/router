@@ -18,6 +18,7 @@ import (
 	"weave-os/router/internal/router"
 	"weave-os/router/internal/router/catalog"
 	"weave-os/router/internal/router/cluster"
+	"weave-os/router/internal/router/escalation"
 	"weave-os/router/internal/router/handover"
 	"weave-os/router/internal/router/hmm"
 	"weave-os/router/internal/router/planner"
@@ -418,6 +419,8 @@ const policyDeadlineFallbackReason = "policy_deadline_last_known_good"
 // policyDeadlineDefaultReason is the Decision.Reason when a deadline miss with no pin falls to the tier-3 default.
 const policyDeadlineDefaultReason = "policy_deadline_default_model"
 
+const unscorableHMMStickyReason = "hmm_no_user_boundary_sticky"
+
 // isPolicyDeadlineErr reports whether err is a policy sidecar deadline/transport
 // failure (safe to degrade) rather than a contract violation (must fail closed).
 // Both context.DeadlineExceeded/Canceled and hmm.ErrHMMUnavailable must be present —
@@ -531,8 +534,10 @@ func (s *Service) isHardPinnedTurn(ctx context.Context, tt turntype.TurnType) bo
 // nothing pinned applies to it, and its cheap verdict decision must not leak
 // into the conversation that follows. Proactive compaction skips it too: the
 // transcript it grades is the payload, not history the router may rewrite.
+// A recap is a side fork shown beneath the reply the user just read, so it
+// gets no routing marker, and its decision must not move the session pin.
 func isUnpinnedScoredTurn(tt turntype.TurnType) bool {
-	return tt == turntype.Classifier
+	return tt == turntype.Classifier || tt == turntype.Recap
 }
 
 // routeWithoutPin scores a turn that has no session pin to honor or anchor:
@@ -714,6 +719,10 @@ func (s *Service) runTurnLoop(
 	if compatibilityErr != nil {
 		return turnLoopResult{}, compatibilityErr
 	}
+	if planOwnedServingRequest(ctx) {
+		req.ForceModel = ""
+		req.ForceCluster = ""
+	}
 	ctx = context.WithValue(ctx, translationPlanAppliedContextKey{}, true)
 	// The turn-loop has to load this before any automatic pin or utility hard-pin
 	// branch; routeFor receives a copy and cannot populate the caller's request.
@@ -756,6 +765,9 @@ func (s *Service) runTurnLoop(
 	res.AuthoritativePerTurn = authoritativePolicyTurn(res.TurnType) &&
 		s.authoritativePerTurnSelection(ctx)
 	res.PinRole = roleForTier(res.RequestedTier)
+	if res.Strategy == router.StrategyLLMClassifier {
+		return s.runClassifierTurn(ctx, req, res, threadSessionKey)
+	}
 	log.Info("turnloop classified",
 		"turn_type", string(res.TurnType),
 		"requested_tier", res.RequestedTier.String(),
@@ -874,6 +886,7 @@ func (s *Service) runTurnLoop(
 			"pin_model", forceModelPin.Model,
 			"pin_provider", forceModelPin.Provider,
 			"drop_reason", res.ForcedPinDropReason,
+			"enabled_providers", sortedEnabledKeys(req.EnabledProviders),
 			"role", res.PinRole,
 		)
 	}
@@ -1237,6 +1250,7 @@ func (s *Service) runTurnLoop(
 			"pin_model", forceModelPin.Model,
 			"pin_provider", forceModelPin.Provider,
 			"drop_reason", res.ForcedPinDropReason,
+			"enabled_providers", sortedEnabledKeys(req.EnabledProviders),
 			"role", res.PinRole,
 		)
 		if excluded || !imageCapable {
@@ -1284,6 +1298,7 @@ func (s *Service) runTurnLoop(
 			"pin_provider", pin.Provider,
 			"pin_reason", pin.Reason,
 			"drop_reason", dropReason,
+			"enabled_providers", sortedEnabledKeys(req.EnabledProviders),
 			"role", res.PinRole,
 		)
 		if isUserForcedReason(pin.Reason) {
@@ -1561,11 +1576,32 @@ func (s *Service) runTurnLoop(
 	if llmTurn != nil && llmTurn.active {
 		req.Escalation = llmTurn.constraint()
 	}
+	if pinFound {
+		req.PreviousPolicyGroup = escalation.Group(pin.PolicyGroup)
+	}
 
 	// Retry only selection after a failed escalation commit. Replaying the
 	// entry path would observe search decay and prefix trimming twice and lose
 	// the already-computed translation eligibility and pin-drop evidence.
 	routeRemaining := func() (turnLoopResult, error) {
+		// A command-only continuation has no user-authored text to classify.
+		// Keep an eligible session model instead of rescoring synthetic client
+		// wrappers or switching to the requested baseline mid-conversation.
+		if req.Escalation == nil && pinFound && automaticPinEligible(pin, req) && req.ConversationMessages != nil &&
+			router.IsHMMStrategy(router.StrategyFromContext(ctx)) &&
+			!hasTextUserBoundary(req.ConversationMessages) {
+			if _, honoured := router.HonouredPolicyPin(ctx); !honoured {
+				decision := pinDecision(pin)
+				decision.Reason = unscorableHMMStickyReason
+				res.Decision = decision
+				res.StickyHit = true
+				res.PinTier = unscorableHMMStickyReason
+				log.Info("HMM turn has no user text; preserving eligible session pin",
+					"pin_model", pin.Model, "pin_provider", pin.Provider)
+				s.refreshPin(ctx, installationID, res.SessionKey, pin, res.PinRole, pinDecision(pin))
+				return res, nil
+			}
+		}
 		// Tool-result turns: by default, fall through to the scorer + planner for
 		// MainLoop parity. Kill switch preserves the legacy #82 verbatim-reuse path.
 		// The #82 noisy-embedding concern is stale under only_user_message embed mode:
@@ -2500,6 +2536,9 @@ func (s *Service) loadPinWithStoreState(ctx context.Context, sessionKey [session
 	}
 	if !found {
 		return sessionpin.Pin{}, false, true
+	}
+	if planOwnedServingRequest(ctx) && isUserForcedReason(pin.Reason) {
+		return pin, false, false
 	}
 	if !pinMatchesEffectiveStrategy(ctx, pin) {
 		return sessionpin.Pin{}, false, false

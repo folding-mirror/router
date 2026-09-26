@@ -2,6 +2,7 @@ package policyregistry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,48 +38,67 @@ func (r *Registry) VerifyServingArtifact(ctx context.Context, ref ObjectRef) err
 	return nil
 }
 
-// PublishServingManifest publishes validated canonical bytes without activating any target.
+// PublishServingManifest publishes validated v2 manifest bytes to artifacts/, addressed by their
+// own digest, without activating any target. The v1 namespaces are read-only.
 func (r *Registry) PublishServingManifest(ctx context.Context, kind ServingKind, payload []byte) (ObjectRef, error) {
-	if _, err := DecodeServingManifest(payload, r.rootURI, kind); err != nil {
-		return ObjectRef{}, err
-	}
-	namespace, err := servingNamespace(kind)
-	if err != nil {
+	if _, err := DecodePublishableServingManifest(payload, r.rootURI, kind); err != nil {
 		return ObjectRef{}, err
 	}
 	digest := Digest(payload)
-	return r.publishImmutable(ctx, r.prefix+"/"+namespace+digest+".json", payload, digest)
+	return r.publishImmutable(ctx, r.prefix+"/"+servingArtifactsNamespace+digest+".json", payload, digest)
 }
 
-// ReadServingObject validates exact storage generation, digest, namespace and schema.
-func (r *Registry) ReadServingObject(ctx context.Context, kind ServingKind, ref ObjectRef) (ServingManifest, error) {
-	if err := ValidateServingRef(ref, r.rootURI, kind); err != nil {
-		return nil, err
-	}
-	namespace, err := servingNamespace(kind)
+// ReadServingObject validates the reference, namespace and schema, and returns the manifest
+// decoded from the exact stored payload at the referenced generation. The layout the reference
+// uses selects the decoder: legacy namespaces hold v1 objects, artifacts/ holds v2 objects.
+func (r *Registry) ReadServingObject(ctx context.Context, kind ServingKind, ref ObjectRef) (ServingManifest, []byte, error) {
+	namespace, err := servingRefNamespace(ref, r.rootURI, kind)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	payload, err := r.readExact(ctx, ref, namespace)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return DecodeServingManifest(payload, r.rootURI, kind)
+	manifest, err := DecodeServingObject(payload, r.rootURI, kind, ref)
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifest, payload, nil
 }
 
-// ServingRef resolves a selected digest once, before proposal approval.
+// ServingRef resolves a selected digest once, before proposal approval. A v2 kind resolves the
+// artifacts/ layout first and falls back to the legacy namespace of the v1 object it folds.
 func (r *Registry) ServingRef(ctx context.Context, kind ServingKind, digest string) (ObjectRef, error) {
 	if !validDigest(digest) {
 		return ObjectRef{}, errors.New("invalid serving digest")
 	}
-	namespace, err := servingNamespace(kind)
+	namespaces, err := servingNamespaces(kind)
 	if err != nil {
 		return ObjectRef{}, err
 	}
-	return r.objectRef(ctx, r.prefix+"/"+namespace+digest+".json", digest)
+	for index, namespace := range namespaces {
+		ref, err := r.objectRef(ctx, r.prefix+"/"+namespace+digest+".json", digest)
+		if errors.Is(err, ErrNotFound) && index < len(namespaces)-1 {
+			continue
+		}
+		return ref, err
+	}
+	return ObjectRef{}, ErrNotFound
 }
 
+// servingStateName is the authoritative mutable state object for a target.
 func (r *Registry) servingStateName(target ServingTarget) (string, error) {
+	environment, err := target.Environment()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s/state/%s/%s.json", r.prefix, environment, target), nil
+}
+
+// servingLegacyStateName is the pre-v2 state object; it is read only until the target's
+// first write to servingStateName and is never written afterwards.
+func (r *Registry) servingLegacyStateName(target ServingTarget) (string, error) {
 	environment, err := target.Environment()
 	if err != nil {
 		return "", err
@@ -86,12 +106,31 @@ func (r *Registry) servingStateName(target ServingTarget) (string, error) {
 	return fmt.Sprintf("%s/runtime_state/router_serving/v1/targets/%s/%s/state.json", r.prefix, environment, target), nil
 }
 
-// ReadServingState performs an authoritative read on every admission; there is no stale-state fallback.
+// ReadServingState performs an authoritative read on every admission; there is no stale-state
+// fallback. The new state path wins whenever it exists; a target that has not yet been written
+// under the new layout is served from its legacy state object and flagged as such.
 func (r *Registry) ReadServingState(ctx context.Context, target ServingTarget) (ServingStateSnapshot, error) {
 	name, err := r.servingStateName(target)
 	if err != nil {
 		return ServingStateSnapshot{}, err
 	}
+	snapshot, err := r.readServingStateObject(ctx, name, target)
+	if !errors.Is(err, ErrNotFound) {
+		return snapshot, err
+	}
+	legacyName, err := r.servingLegacyStateName(target)
+	if err != nil {
+		return ServingStateSnapshot{}, err
+	}
+	snapshot, err = r.readServingStateObject(ctx, legacyName, target)
+	if err != nil {
+		return ServingStateSnapshot{}, err
+	}
+	snapshot.LegacyPath = true
+	return snapshot, nil
+}
+
+func (r *Registry) readServingStateObject(ctx context.Context, name string, target ServingTarget) (ServingStateSnapshot, error) {
 	attrs, err := r.bucket.Object(name).Attrs(ctx)
 	if err != nil {
 		return ServingStateSnapshot{}, classifyStorageError("read serving control-state attributes", err)
@@ -112,6 +151,10 @@ func (r *Registry) ReadServingState(ctx context.Context, target ServingTarget) (
 
 // CompareAndSwapServingState commits current activation, supersession and withdrawals in one write.
 // This persistence primitive is used only by ServingController, after complete proposal validation.
+// Writes always land on state/<environment>/<target>.json: a target still served from the legacy
+// runtime_state object is migrated by its first write, which the caller issues with generation 0
+// (ServingStateSnapshot.WriteGeneration) so that DoesNotExist guards the bootstrap. The legacy
+// object is never rewritten.
 func (r *Registry) CompareAndSwapServingState(ctx context.Context, next ServingControlState, expectedGeneration int64) (ServingStateSnapshot, error) {
 	if expectedGeneration < 0 {
 		return ServingStateSnapshot{}, errors.New("negative expected serving generation")
@@ -123,7 +166,7 @@ func (r *Registry) CompareAndSwapServingState(ctx context.Context, next ServingC
 	if err != nil {
 		return ServingStateSnapshot{}, err
 	}
-	payload, err := CanonicalBytes(next)
+	payload, err := json.Marshal(next)
 	if err != nil {
 		return ServingStateSnapshot{}, err
 	}

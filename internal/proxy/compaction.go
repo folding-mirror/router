@@ -12,6 +12,7 @@ import (
 	"weave-os/router/internal/router"
 	"weave-os/router/internal/router/catalog"
 	"weave-os/router/internal/router/handover"
+	"weave-os/router/internal/router/hmm"
 	"weave-os/router/internal/router/policy"
 	"weave-os/router/internal/router/sessionpin"
 	"weave-os/router/internal/router/turntype"
@@ -267,6 +268,11 @@ func clientWouldCompact(pol compactionPolicy, budget router.ClientBudget, maxWin
 // a transcript it carries as payload, or the harness policy defers to the
 // client's own compaction.
 func (s *Service) maybeCompact(ctx context.Context, env *translate.RequestEnvelope, in compactionInput) (compactionResult, error) {
+	// The classifier requires the exact causal prefix. Compaction must never
+	// silently replace the context from which its counters and digests derive.
+	if router.StrategyFromContext(ctx) == router.StrategyLLMClassifier {
+		return compactionResult{}, nil
+	}
 	log := observability.FromContext(ctx)
 	var res compactionResult
 	if s.compactionTriggerPct <= 0 || in.MaxWindow <= 0 || env == nil || s.isHardPinnedTurn(ctx, in.TurnType) || isUnpinnedScoredTurn(in.TurnType) {
@@ -486,6 +492,7 @@ func (s *Service) compactionSessionModel(ctx context.Context, sessionKey [sessio
 	if model == "" {
 		model = served.Model
 	}
+	model, _ = hmm.SplitEffort(model)
 	model = catalog.LatestInFamily(model, func(candidate string) bool {
 		m, known := catalog.ByID(candidate)
 		if !known || m.Tier == catalog.TierLow {

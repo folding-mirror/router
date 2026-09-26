@@ -7,7 +7,7 @@ published as a compatibility alias and continues to receive the same releases;
 it prints a migration warning directing users to `@weave-os/router`.
 
 ```bash
-npx @weave-os/router                       # interactive: pick Claude Code / Codex / opencode / pi, then scope
+npx @weave-os/router                       # open the hosted setup page
 npx @weave-os/router --claude              # skip the picker, target Claude Code
 npx @weave-os/router --codex               # skip the picker, target the OpenAI Codex CLI
 npx @weave-os/router setup --claude --codex # configure both native clients
@@ -21,28 +21,9 @@ npx @weave-os/router --scope project       # per-repo install, commit settings.j
 npx @weave-os/router --local               # self-hosted via docker-compose (localhost:8080)
 npx @weave-os/router --base-url https://router.acme.internal
 npx @weave-os/router --email you@example.com # set identity without prompting
+npx @weave-os/router --claude --return-url https://app.example.com/onboarding # continue after a verified install
 npx @weave-os/router --non-interactive     # reads $WEAVE_ROUTER_KEY, no prompts (defaults to claude)
 ```
-
-Re-running the installer to pick up changes reuses the key already on disk, so
-you paste it once and never again — for every client, not just Claude Code.
-`update` is the never-prompting form of that (safe for cron; errors instead of
-asking when no key can be found):
-
-```bash
-npx @weave-os/router --claude                # reuses the installed key
-npx @weave-os/router --codex                 # same for Codex, opencode, and pi
-npx @weave-os/router --claude --rotate-key   # ignore it and prompt for a new one
-npx @weave-os/router update --claude         # non-interactive refresh in place
-npx @weave-os/router update --claude --context-window 1m # opt into Claude's 1M local context
-```
-
-Claude Code normally keeps a 200k local context budget when using a custom
-router endpoint. The explicit `--context-window 1m` option selects the
-supported `[1m]` model variant, preserves automatic compaction, and records
-the prior model so `off` or uninstall can restore it. It is opt-in: longer
-histories can increase token usage and cost, and the upstream provider still
-needs to support the requested context size.
 
 For Claude Code the installed statusline and `/force-model`, `/router-*` slash
 commands also refresh themselves in the background about once a week (never
@@ -120,11 +101,17 @@ Four install targets:
   api.anthropic.com.
 - **Codex** (`--codex`) — patches `~/.codex/config.toml` (or
   `<repo>/.codex/config.toml`) with a managed `[model_providers.weave]`
-  block plus `model_provider = "weave"`. The provider preserves the existing
-  ChatGPT OAuth login. No install pins `X-Weave-Router-Strategy`; every
-  endpoint keeps its router's configured default. HMM or forced
-  `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` turns use that plan;
-  every other selected model uses its WorkWeave deployment or BYOK credential.
+  block plus `model_provider = "weave"`. Fresh installs select `weave-auto`,
+  while reinstalling preserves an existing model choice. The provider preserves
+  the active ChatGPT OAuth login. No install pins `X-Weave-Router-Strategy`;
+  every endpoint keeps its router's configured default. Codex's native
+  `/model` picker can force a named model and its selected reasoning effort;
+  **Weave Router (automatic)** resumes per-request routing. An existing `$fm`
+  session pin still applies in automatic mode until `$ufm` clears it. Re-run
+  `npx @weave-os/router --codex` and restart Codex to enable this on an older
+  install. `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-6-sol`
+  can use the active ChatGPT plan; other selected models use their WorkWeave
+  deployment or BYOK credential.
   The block lives between begin/end markers
   so re-running the installer rewrites it cleanly and `--uninstall --codex`
    removes it without touching the rest of your config. Codex does not load
@@ -154,6 +141,13 @@ Four install targets:
 
 See the [main installer docs](https://github.com/weave-os/router/tree/main/install)
 for the full reference.
+
+## License
+
+Apache-2.0 starting with version `0.2.24` of both `@weave-os/router` and
+`@workweave/router`. See the bundled `LICENSE` and `NOTICE` files.
+Earlier published versions retain their original licenses. Third-party peer
+dependencies are separately licensed and are not bundled in this package.
 
 ## Requirements
 

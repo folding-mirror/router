@@ -100,6 +100,11 @@ type EmitOptions struct {
 	// proxy sets this on a one-shot retry after such a 400 since AUTO skips
 	// compilation. No-op when VALIDATED wouldn't have been used.
 	DowngradeGeminiValidatedToAuto bool
+	// ReasoningReplayScope identifies the upstream account+model this request
+	// dispatches to, so encrypted reasoning carried on the history is replayed
+	// only where it was minted (see openai_reasoning_signature.go). Empty
+	// replays nothing.
+	ReasoningReplayScope string
 	// FastMode dispatches on the provider's paid fast tier: OpenAI
 	// service_tier:"priority", Anthropic speed:"fast" (+ beta). Honored only
 	// for first-party OpenAI/Anthropic targets; gateways relay their own tier.
@@ -478,9 +483,10 @@ type EmitOverrides struct {
 	// is a router-minted cross-format envelope (`encodeOpenAIReasoningSignature`),
 	// not a real Anthropic signature. Set unconditionally for Anthropic targets.
 	StripForeignSignedThinkingBlocks bool
-	// SanitizeToolUseIDs rewrites tool_use.id / tool_use_id values outside
-	// ^[a-zA-Z0-9_-]+$. Always set for Anthropic targets: upstreams like
-	// Kimi-k2.6 emit IDs (e.g. "functions.Read:0") Anthropic rejects on replay.
+	// SanitizeToolUseIDs strips the router-minted OpenAI reasoning carrier and rewrites
+	// tool_use.id / tool_use_id values outside ^[a-zA-Z0-9_-]+$. Always set for
+	// Anthropic targets: upstreams like Kimi-k2.6 emit IDs (e.g.
+	// "functions.Read:0") Anthropic rejects on replay.
 	SanitizeToolUseIDs bool
 	// StripThoughtSignature removes `thought_signature` from content blocks.
 	// Set for Anthropic targets: the field is Gemini-only and Anthropic 400s
@@ -852,7 +858,7 @@ func isForeignSignedThinkingBlock(block gjson.Result) bool {
 	if block.Get("type").String() != "thinking" {
 		return false
 	}
-	_, _, ok := decodeOpenAIReasoningSignature(block.Get("signature").String())
+	_, ok := decodeOpenAIReasoningSignature(block.Get("signature").String())
 	return ok
 }
 
@@ -871,13 +877,22 @@ func blockNeedsToolUseIDSanitize(block gjson.Result) bool {
 	switch block.Get("type").String() {
 	case "tool_use":
 		id := block.Get("id").String()
-		return sanitizeToolUseID(id) != id
+		return anthropicRequestToolUseID(id) != id
 	case "tool_result":
 		id := block.Get("tool_use_id").String()
-		return sanitizeToolUseID(id) != id
+		return anthropicRequestToolUseID(id) != id
 	default:
 		return false
 	}
+}
+
+// anthropicRequestToolUseID drops the router-minted OpenAI reasoning carrier
+// before sanitizing: Anthropic cannot use it, and it costs up to ~8KB of prompt
+// per echoed id. Both ends of a tool_use/tool_result pair reduce to the same id.
+// The Gemini thought carrier stays (see StripThoughtSignature).
+func anthropicRequestToolUseID(id string) string {
+	id, _ = stripOpenAIReasoningCarrier(id)
+	return sanitizeToolUseID(id)
 }
 
 func sanitizeBlockToolUseID(raw string) (string, error) {
@@ -885,14 +900,14 @@ func sanitizeBlockToolUseID(raw string) (string, error) {
 	switch block.Get("type").String() {
 	case "tool_use":
 		id := block.Get("id").String()
-		out, err := sjson.Set(raw, "id", sanitizeToolUseID(id))
+		out, err := sjson.Set(raw, "id", anthropicRequestToolUseID(id))
 		if err != nil {
 			return "", fmt.Errorf("rewrite tool_use id: %w", err)
 		}
 		return out, nil
 	case "tool_result":
 		id := block.Get("tool_use_id").String()
-		out, err := sjson.Set(raw, "tool_use_id", sanitizeToolUseID(id))
+		out, err := sjson.Set(raw, "tool_use_id", anthropicRequestToolUseID(id))
 		if err != nil {
 			return "", fmt.Errorf("rewrite tool_use_id: %w", err)
 		}
@@ -1076,6 +1091,16 @@ func stripPatternFromMessages(body []byte, pattern *regexp.Regexp) ([]byte, erro
 // it back as a standalone part on the next turn; stripping it on ingress keeps
 // it out of upstream context. Parts whose text becomes empty are dropped.
 func StripFeedbackFooterFromGeminiContents(body []byte) ([]byte, error) {
+	return stripPatternFromGeminiContents(body, feedbackFooterPattern)
+}
+
+// StripRoutingMarkerFromGeminiContents removes the router-owned selection
+// marker, including its optional reasoning line, from echoed model text.
+func StripRoutingMarkerFromGeminiContents(body []byte) ([]byte, error) {
+	return stripPatternFromGeminiContents(body, routingMarkerPattern)
+}
+
+func stripPatternFromGeminiContents(body []byte, pattern *regexp.Regexp) ([]byte, error) {
 	contents := gjson.GetBytes(body, "contents")
 	if !contents.Exists() || !contents.IsArray() {
 		return body, nil
@@ -1101,11 +1126,11 @@ func StripFeedbackFooterFromGeminiContents(body []byte) ([]byte, error) {
 				return true
 			}
 			text := textNode.String()
-			if !feedbackFooterPattern.MatchString(text) {
+			if !pattern.MatchString(text) {
 				newParts = append(newParts, part.Raw)
 				return true
 			}
-			stripped := feedbackFooterPattern.ReplaceAllString(text, "")
+			stripped := pattern.ReplaceAllString(text, "")
 			contentChanged = true
 			if strings.TrimSpace(stripped) == "" {
 				return true
@@ -1405,8 +1430,8 @@ var modelMaxOutputTokens = map[string]int{
 	"gpt-5.5-nano": 128000,
 	"gpt-5.6-sol":  128000, "gpt-5.6-sol-pro": 128000,
 	"gpt-5.6-terra": 128000, "gpt-5.6-luna": 128000, "gpt-5.6-luna-pro": 128000,
-	"gpt-6-astra": 128000,
-	"grok-4.5":    131072, "grok-4.6": 131072,
+	"gpt-6-astra": 128000, "gpt-6-sol": 128000, "gpt-6-luna": 128000,
+	"grok-4.5": 131072, "grok-4.6": 131072, "grok-4.7": 131072,
 	"muse-spark-1.3": 131072, // Meta documents a 128K max output; always-on reasoning shares the budget
 	"o1":             100000, "o1-pro": 100000, "o1-mini": 65536,
 	"o3": 100000, "o3-pro": 100000, "o3-mini": 100000,
@@ -1428,6 +1453,7 @@ var modelMaxOutputTokens = map[string]int{
 	"qwen/qwen3-235b-a22b-2507":        16384,
 	"qwen/qwen3-next-80b-a3b-instruct": 16384,
 	"deepseek/deepseek-v4-flash":       131072, // DeepSeek V4 documents 384K max output
+	"deepseek/deepseek-v4.1-flash":     131072,
 	"deepseek/deepseek-v4-pro":         131072,
 	"deepseek/deepseek-v4-pro-0813":    131072,
 	"minimax/minimax-m3":               131072, // 512K context, output up to the window

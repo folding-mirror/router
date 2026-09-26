@@ -47,10 +47,18 @@ func (e *ForcedModelUnknownError) Error() string {
 func (e *ForcedModelUnknownError) Unwrap() error { return ErrForcedModelUnknown }
 
 var forceModelAliases = map[string]string{
-	"anthropic":   "claude-opus-5",
-	"claude":      "claude-opus-5",
-	"opus":        "claude-opus-5",
-	"claude-opus": "claude-opus-5",
+	// Opus family aliases follow 5.5; Opus 5's own-name aliases keep
+	// resolving so existing direct pins still serve.
+	"anthropic":   "claude-opus-5-5",
+	"claude":      "claude-opus-5-5",
+	"opus":        "claude-opus-5-5",
+	"claude-opus": "claude-opus-5-5",
+	"opus-5.5":    "claude-opus-5-5",
+	"opus-5-5":    "claude-opus-5-5",
+	"opus5.5":     "claude-opus-5-5",
+	"opus55":      "claude-opus-5-5",
+	"claude-5.5":  "claude-opus-5-5",
+	"claude-5-5":  "claude-opus-5-5",
 	"opus-5":      "claude-opus-5",
 	"opus-5.0":    "claude-opus-5",
 	"opus5":       "claude-opus-5",
@@ -84,34 +92,41 @@ var forceModelAliases = map[string]string{
 	// they pointed at gpt-5.5 until it was retired. Version-specific aliases
 	// (gpt-5-5*) deliberately still resolve to their exact model, which stays
 	// available as priced passthrough.
-	"gpt":        "gpt-5.6-sol",
-	"openai":     "gpt-5.6-sol",
+	"gpt":        "gpt-6-sol",
+	"openai":     "gpt-6-sol",
 	"gpt-6":      "gpt-6-astra",
 	"gpt6":       "gpt-6-astra",
 	"gpt-6astra": "gpt-6-astra",
 	"astra":      "gpt-6-astra",
+	// Bare sol/luna follow the GPT-6 generation; gpt-5-6-* keeps the 5.6 rows.
+	"sol":       "gpt-6-sol",
+	"gpt6sol":   "gpt-6-sol",
+	"gpt-6sol":  "gpt-6-sol",
+	"luna":      "gpt-6-luna",
+	"gpt6luna":  "gpt-6-luna",
+	"gpt-6luna": "gpt-6-luna",
 	// The bare gpt-5.6 alias routes to Sol, matching OpenAI's own alias.
 	"gpt-5.6":       "gpt-5.6-sol",
 	"gpt-5-6":       "gpt-5.6-sol",
-	"sol":           "gpt-5.6-sol",
 	"gpt-5-6-sol":   "gpt-5.6-sol",
 	"terra":         "gpt-5.6-terra",
 	"gpt-5-6-terra": "gpt-5.6-terra",
-	"luna":          "gpt-5.6-luna",
 	"gpt-5-6-luna":  "gpt-5.6-luna",
 	"gpt-5-5":       "gpt-5.5",
 	"gpt-5-5-pro":   "gpt-5.5-pro",
 	"gpt-5-5-mini":  "gpt-5.5-mini",
 	"gpt-5-5-nano":  "gpt-5.5-nano",
 	// grok-4.5 is retired from routing (no AA Agentic Index score, never rostered).
-	// Family aliases follow flagship 4.6; own-name alias keeps grok-4.5 as passthrough.
-	"grok":                  "grok-4.6",
+	// Family aliases follow flagship 4.7; own-name aliases keep older models as passthrough.
+	"grok":                  "grok-4.7",
 	"grok-4.5":              "grok-4.5",
 	"grok4.5":               "grok-4.5",
-	"xai":                   "grok-4.6",
+	"xai":                   "grok-4.7",
 	"grok-4.6":              "grok-4.6",
 	"grok4.6":               "grok-4.6",
-	"grok-max":              "grok-4.6",
+	"grok-4.7":              "grok-4.7",
+	"grok4.7":               "grok-4.7",
+	"grok-max":              "grok-4.7",
 	"muse-spark-1.3":        "muse-spark-1.3",
 	"muse-spark-1-3":        "muse-spark-1.3",
 	"musespark-1.3":         "muse-spark-1.3",
@@ -133,11 +148,13 @@ var forceModelAliases = map[string]string{
 	"gemini-3-8-flash":      "gemini-3.8-flash",
 	// The family alias follows Makora's V4-Pro EOL onto Flash; deepseek-pro
 	// still names V4-Pro explicitly, which is passthrough-only now.
-	"deepseek":       "deepseek/deepseek-v4-flash",
-	"deepseek-pro":   "deepseek/deepseek-v4-pro",
-	"deepseek-flash": "deepseek/deepseek-v4-flash",
-	"qwen":           "qwen/qwen3-coder",
-	"qwen-coder":     "qwen/qwen3-coder",
+	"deepseek":            "deepseek/deepseek-v4-flash",
+	"deepseek-pro":        "deepseek/deepseek-v4-pro",
+	"deepseek-flash":      "deepseek/deepseek-v4-flash",
+	"deepseek-v4-1-flash": "deepseek/deepseek-v4.1-flash",
+	"deepseek-v4p1-flash": "deepseek/deepseek-v4.1-flash",
+	"qwen":                "qwen/qwen3-coder",
+	"qwen-coder":          "qwen/qwen3-coder",
 	// qwen3.7-plus is retired from routing but still servable as passthrough;
 	// keep its own-name alias so direct pins resolve.
 	"qwen3.7-plus": "qwen/qwen3.7-plus",
@@ -345,7 +362,7 @@ func (s *Service) loadForceModelSessionPin(
 	ctx context.Context,
 	sessionKey [sessionpin.SessionKeyLen]byte,
 ) (sessionpin.Pin, bool, bool) {
-	if s.pinStore == nil {
+	if s.pinStore == nil || planOwnedServingRequest(ctx) {
 		return sessionpin.Pin{}, false, false
 	}
 	pin, found, err := s.pinStore.Get(ctx, sessionKey, forceModelSessionRole)
@@ -476,6 +493,9 @@ func (s *Service) applyForceModelHeader(
 	installationID uuid.UUID,
 	forceModelSessionKey [sessionpin.SessionKeyLen]byte,
 ) (context.Context, string, error) {
+	if planOwnedServingRequest(ctx) {
+		return ctx, "", nil
+	}
 	raw := strings.TrimSpace(r.Header.Get(ForceModelHeader))
 	if raw == "" {
 		return ctx, "", nil
@@ -570,6 +590,13 @@ func (s *Service) applyForceModelCommand(
 	// StripRoutingMarkerFromMessages strips it from later inbound requests;
 	// otherwise it'd persist in history and leak router internals upstream.
 	var msg string
+	if planOwnedServingRequest(ctx) && !cmd.Clear {
+		msg = "✦ **Weave Router** → this subscription uses automatic model selection\n\n"
+		if env.SourceFormat() == translate.FormatOpenAI {
+			msg = "Weave Router: this subscription uses automatic model selection."
+		}
+		return "", msg, nil
+	}
 	if cmd.Clear {
 		if err := s.clearLegacyForceModelPins(ctx, installationID, threadSessionKey); err != nil {
 			log.Error("/unforce-model: legacy pin cleanup failed", "err", err)

@@ -302,6 +302,15 @@ var Models = []Model{
 		{Provider: providers.ProviderAnthropicGateway, Price: Pricing{InputUSDPer1M: 5.00, OutputUSDPer1M: 25.00, CacheReadMultiplier: 0.10}},
 		{Provider: providers.ProviderOpenAIGateway, Price: Pricing{InputUSDPer1M: 5.00, OutputUSDPer1M: 25.00}},
 	}},
+	// Opus 5.5: $4/$20, cache reads at $0.20/MTok (0.05x), fast mode $8/$40.
+	// Native 1M context, adaptive thinking always on, forced tool_choice
+	// rejected like Fable 5.1. Not a cluster roster member until it has
+	// quality labels.
+	{ID: "claude-opus-5-5", Source: SourceClosedSource, Tier: TierHigh, ContextWindow: 1_000_000, Providers: []ProviderBinding{
+		{Provider: providers.ProviderAnthropic, Price: Pricing{InputUSDPer1M: 4.00, OutputUSDPer1M: 20.00, CacheReadMultiplier: 0.05}, FastPrice: Pricing{InputUSDPer1M: 8.00, OutputUSDPer1M: 40.00}},
+		{Provider: providers.ProviderAnthropicGateway, Price: Pricing{InputUSDPer1M: 4.00, OutputUSDPer1M: 20.00, CacheReadMultiplier: 0.05}},
+		{Provider: providers.ProviderOpenAIGateway, Price: Pricing{InputUSDPer1M: 4.00, OutputUSDPer1M: 20.00}},
+	}},
 	// Fable 5 retired from routing; kept as priced passthrough so lingering
 	// BYOK/direct pins and the compaction summarizer bill at real cost.
 	// Safety classifiers can return stop_reason "refusal" (HTTP 200); see
@@ -445,6 +454,26 @@ var Models = []Model{
 			LongContext: &LongContextPricing{ThresholdTokens: 272_000, InputUSDPer1M: 40.00, OutputUSDPer1M: 150.00, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10},
 		}},
 	}},
+	// --- OpenAI GPT-6 Sol/Luna --- same >272K (2x in, 1.5x out) and 2x fast
+	// schedule as Astra.
+	{ID: "gpt-6-sol", Source: SourceClosedSource, Tier: TierHigh, ContextWindow: 1_050_000, Providers: []ProviderBinding{
+		{Provider: providers.ProviderOpenAI, Price: Pricing{
+			InputUSDPer1M: 2.00, OutputUSDPer1M: 10.00, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10,
+			LongContext: &LongContextPricing{ThresholdTokens: 272_000, InputUSDPer1M: 4.00, OutputUSDPer1M: 15.00, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10},
+		}, FastPrice: Pricing{
+			InputUSDPer1M: 4.00, OutputUSDPer1M: 20.00, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10,
+			LongContext: &LongContextPricing{ThresholdTokens: 272_000, InputUSDPer1M: 8.00, OutputUSDPer1M: 30.00, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10},
+		}},
+	}},
+	{ID: "gpt-6-luna", Source: SourceClosedSource, Tier: TierMid, ContextWindow: 1_050_000, Providers: []ProviderBinding{
+		{Provider: providers.ProviderOpenAI, Price: Pricing{
+			InputUSDPer1M: 0.10, OutputUSDPer1M: 0.50, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10,
+			LongContext: &LongContextPricing{ThresholdTokens: 272_000, InputUSDPer1M: 0.20, OutputUSDPer1M: 0.75, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10},
+		}, FastPrice: Pricing{
+			InputUSDPer1M: 0.20, OutputUSDPer1M: 1.00, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10,
+			LongContext: &LongContextPricing{ThresholdTokens: 272_000, InputUSDPer1M: 0.40, OutputUSDPer1M: 1.50, CacheWriteMultiplier: 1.25, CacheReadMultiplier: 0.10},
+		}},
+	}},
 
 	// --- xAI Grok --- native only; OpenRouter unused in prod.
 	// Standard rate (<200K) used; long-context repricing is a future Pricing follow-up.
@@ -452,6 +481,9 @@ var Models = []Model{
 		{Provider: providers.ProviderXAI, Price: Pricing{InputUSDPer1M: 2.00, OutputUSDPer1M: 6.00, CacheReadMultiplier: 0.25}},
 	}},
 	{ID: "grok-4.6", Source: SourceClosedSource, Tier: TierHigh, ContextWindow: 500_000, Providers: []ProviderBinding{
+		{Provider: providers.ProviderXAI, Price: Pricing{InputUSDPer1M: 2.00, OutputUSDPer1M: 6.00, CacheReadMultiplier: 0.25}},
+	}},
+	{ID: "grok-4.7", Source: SourceClosedSource, Tier: TierHigh, ContextWindow: 500_000, Providers: []ProviderBinding{
 		{Provider: providers.ProviderXAI, Price: Pricing{InputUSDPer1M: 2.00, OutputUSDPer1M: 6.00, CacheReadMultiplier: 0.25}},
 	}},
 
@@ -559,6 +591,37 @@ var Models = []Model{
 			Price: Pricing{InputUSDPer1M: 0.280, OutputUSDPer1M: 0.560, CacheReadMultiplier: 0.07 / 0.280}},
 		{Provider: providers.ProviderWaferAnthropic, UpstreamID: "DeepSeek-V4-Flash-0731-Fast",
 			Price: Pricing{InputUSDPer1M: 0.280, OutputUSDPer1M: 0.560, CacheReadMultiplier: 0.07 / 0.280}},
+	}},
+	// V4.1-Flash: 552B MoE (8B active prefill / 16B decode), natively
+	// multimodal, 1M context. Fireworks serverless is primary; OpenRouter
+	// trails as the self-hoster fallback.
+	{ID: "deepseek/deepseek-v4.1-flash", Source: SourceOpenSource, Tier: TierLow, ContextWindow: 1_048_576, Providers: []ProviderBinding{
+		{Provider: providers.ProviderFireworks, UpstreamID: "accounts/fireworks/models/deepseek-v4p1-flash",
+			Price: Pricing{InputUSDPer1M: 0.220, OutputUSDPer1M: 0.660, CacheReadMultiplier: 0.007 / 0.220}},
+		{Provider: providers.ProviderOpenRouter, Price: Pricing{InputUSDPer1M: 0.100, OutputUSDPer1M: 0.500, CacheReadMultiplier: 0.10}},
+	}},
+	// Ling-3.0-Flash: DeepInfra is the primary managed OSS route. OpenRouter
+	// remains a trailing self-hosted fallback, but is intentionally never the
+	// first binding for Max traffic.
+	{ID: "inclusionai/ling-3.0-flash", Source: SourceOpenSource, Tier: TierLow, ContextWindow: 262_144, ImageInput: ImageInputUnsupported, Providers: []ProviderBinding{
+		{Provider: providers.ProviderDeepInfra, UpstreamID: "inclusionAI/Ling-3.0-flash",
+			Price: Pricing{InputUSDPer1M: 0.060, OutputUSDPer1M: 0.180, CacheReadMultiplier: 0.20}},
+		{Provider: providers.ProviderOpenRouter, Price: Pricing{InputUSDPer1M: 0.060, OutputUSDPer1M: 0.180, CacheReadMultiplier: 0.10}},
+	}},
+	// MiMo-V2.6 Flash: DeepInfra serves the native OpenAI-compatible endpoint
+	// and exposes Xiaomi's canonical model ID. The model is multimodal and has
+	// a 1M context window; its cache-read rate is 2% of input.
+	{ID: "xiaomi/mimo-v2.6-flash", Source: SourceOpenSource, Tier: TierMid, ContextWindow: 1_048_576, Providers: []ProviderBinding{
+		{Provider: providers.ProviderDeepInfra, UpstreamID: "XiaomiMiMo/MiMo-V2.6-Flash",
+			Price: Pricing{InputUSDPer1M: 0.140, OutputUSDPer1M: 0.280, CacheReadMultiplier: 0.02}},
+		{Provider: providers.ProviderOpenRouter, Price: Pricing{InputUSDPer1M: 0.140, OutputUSDPer1M: 0.280, CacheReadMultiplier: 0.10}},
+	}},
+	// MiMo-V2.6 Pro: same DeepInfra-first policy as Flash, with the higher
+	// capability tier reserved for maximum-complexity Max requests.
+	{ID: "xiaomi/mimo-v2.6-pro", Source: SourceOpenSource, Tier: TierHigh, ContextWindow: 1_048_576, ThinkTagReasoning: true, Providers: []ProviderBinding{
+		{Provider: providers.ProviderDeepInfra, UpstreamID: "XiaomiMiMo/MiMo-V2.6-Pro",
+			Price: Pricing{InputUSDPer1M: 0.435, OutputUSDPer1M: 0.870, CacheReadMultiplier: 0.00827586}},
+		{Provider: providers.ProviderOpenRouter, Price: Pricing{InputUSDPer1M: 0.435, OutputUSDPer1M: 0.870, CacheReadMultiplier: 0.10}},
 	}},
 	// Untiered: Makora EOL'd V4-Pro and recommends V4-Flash, which takes the
 	// tier. Priced and bound so session pins and /force-model still dispatch.
@@ -705,6 +768,8 @@ var Models = []Model{
 	// 1,048,576 (Makora/Together/Fireworks served max); 1,310,720 is
 	// Cloudflare-only.
 	{ID: "z-ai/glm-5.3-flash", Source: SourceOpenSource, Tier: TierLow, ContextWindow: 1_048_576, Providers: []ProviderBinding{
+		{Provider: providers.ProviderDeepInfra, UpstreamID: "zai-org/GLM-5.3-Flash",
+			Price: Pricing{InputUSDPer1M: 0.150, OutputUSDPer1M: 0.500, CacheReadMultiplier: 0.20}},
 		{Provider: providers.ProviderMakora, UpstreamID: "zai-org/GLM-5.3-Flash",
 			Price: Pricing{InputUSDPer1M: 0.150, OutputUSDPer1M: 0.500, CacheReadMultiplier: 0.03 / 0.150}},
 		{Provider: providers.ProviderTogether, UpstreamID: "zai-org/GLM-5.3-Flash",

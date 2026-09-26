@@ -17,6 +17,7 @@ var rosterAliases = map[string]string{
 	"claude-opus-4-8":      "anthropic/claude-opus-4.8",
 	"claude-fable-5":       "anthropic/claude-fable-5",
 	"claude-fable-5-1":     "anthropic/claude-fable-5.1",
+	"claude-opus-5-5":      "anthropic/claude-opus-5.5",
 	"moonshotai/kimi-k2.7": "moonshotai/kimi-k2.7-code",
 	// Bare first-party xAI IDs have no provider prefix to inherit, and the
 	// switch below deliberately stays empty for them (a bare ID whose primary
@@ -24,6 +25,7 @@ var rosterAliases = map[string]string{
 	// what makes an xAI-native model roster-addressable.
 	"grok-4.5": "x-ai/grok-4.5",
 	"grok-4.6": "x-ai/grok-4.6",
+	"grok-4.7": "x-ai/grok-4.7",
 	// Same for Meta's first-party Muse Spark.
 	"muse-spark-1.3": "meta/muse-spark-1.3",
 }

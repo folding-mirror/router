@@ -3,7 +3,10 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // SubscriptionProvider identifies a provider-specific account pool.
@@ -15,6 +18,23 @@ const (
 	// SubscriptionProviderCodex is a Codex subscription account.
 	SubscriptionProviderCodex SubscriptionProvider = "codex"
 )
+
+// SubscriptionAccountState is the credential-free routing health of a linked account.
+type SubscriptionAccountState string
+
+const (
+	SubscriptionAccountStateActive            SubscriptionAccountState = "active"
+	SubscriptionAccountStateExhausted         SubscriptionAccountState = "exhausted"
+	SubscriptionAccountStateCooldown          SubscriptionAccountState = "cooldown"
+	SubscriptionAccountStateReconnectRequired SubscriptionAccountState = "reconnect_required"
+	SubscriptionAccountStateDisabled          SubscriptionAccountState = "disabled"
+	SubscriptionAccountStateUnknown           SubscriptionAccountState = "unknown"
+)
+
+// Routable reports whether an account may be attempted.
+func (s SubscriptionAccountState) Routable() bool {
+	return s == SubscriptionAccountStateActive || s == SubscriptionAccountStateUnknown
+}
 
 // SubscriptionOwner addresses the linked accounts one authenticated caller may
 // serve and manage. SubscriberID is the Router credential subject and survives
@@ -89,13 +109,16 @@ func SubscriptionOwnerForKey(key *APIKey) SubscriptionOwner {
 // account. RefreshTokenCiphertext is encrypted storage and must not cross the
 // auth/service boundary into an API response.
 type SubscriptionAccount struct {
-	ID                     string
-	SubscriberID           string
-	EnrolledByAPIKeyID     string
-	Provider               SubscriptionProvider
-	ExternalAccountID      string
+	ID                 string
+	SubscriberID       string
+	EnrolledByAPIKeyID string
+	Provider           SubscriptionProvider
+	ExternalAccountID  string
+	// DisplayName is provider-supplied metadata for humans; it is not identity.
+	DisplayName            string
 	RefreshTokenCiphertext []byte
 	Enabled                bool
+	State                  SubscriptionAccountState
 	CooldownUntil          *time.Time
 	CreatedAt              time.Time
 }
@@ -105,7 +128,24 @@ type CreateSubscriptionAccountParams struct {
 	Owner             SubscriptionOwner
 	Provider          SubscriptionProvider
 	ExternalAccountID string
+	DisplayName       string
 	RefreshToken      []byte
+	// InstallationExternalID identifies the authenticated installation for onboarding.
+	InstallationExternalID string
+}
+
+// SubscriptionUpsertKind reports whether an upsert inserted, adopted a legacy row, or refreshed an existing identity.
+type SubscriptionUpsertKind string
+
+const (
+	SubscriptionUpsertUpdated  SubscriptionUpsertKind = "updated"
+	SubscriptionUpsertInserted SubscriptionUpsertKind = "inserted"
+	SubscriptionUpsertAdopted  SubscriptionUpsertKind = "adopted"
+)
+
+// FirstConnected reports a genuine first registration, including legacy-row adoption.
+func (k SubscriptionUpsertKind) FirstConnected() bool {
+	return k == SubscriptionUpsertInserted || k == SubscriptionUpsertAdopted
 }
 
 // SubscriptionCredentialRecord is the encrypted credential state for one
@@ -119,6 +159,7 @@ type SubscriptionCredentialRecord struct {
 	TokenRefreshVersion    int64
 	TokenRefreshLeaseID    string
 	Enabled                bool
+	State                  SubscriptionAccountState
 	CooldownUntil          *time.Time
 }
 
@@ -132,6 +173,7 @@ type SubscriptionCredentials struct {
 	TokenRefreshVersion  int64
 	TokenRefreshLeaseID  string
 	Enabled              bool
+	State                SubscriptionAccountState
 	CooldownUntil        *time.Time
 }
 
@@ -159,7 +201,7 @@ type SubscriptionRefreshRepository interface {
 // SubscriptionAccountRepository persists encrypted subscription account state
 // and coordinates cross-replica refresh leases.
 type SubscriptionAccountRepository interface {
-	UpsertSubscriptionAccount(context.Context, CreateSubscriptionAccountParams) (*SubscriptionAccount, error)
+	UpsertSubscriptionAccount(context.Context, CreateSubscriptionAccountParams) (*SubscriptionAccount, SubscriptionUpsertKind, error)
 	ListSubscriptionAccounts(context.Context, SubscriptionOwner) ([]*SubscriptionAccount, error)
 	UpdateSubscriptionAccountState(context.Context, string, SubscriptionOwner, bool, *time.Time) error
 	UpdateSubscriptionAccountCooldown(context.Context, string, SubscriptionOwner, time.Time) error
@@ -201,10 +243,40 @@ func (s *Service) AddSubscriptionAccount(ctx context.Context, params CreateSubsc
 	if err != nil {
 		return nil, err
 	}
-	return s.subscriptionAccounts.UpsertSubscriptionAccount(ctx, CreateSubscriptionAccountParams{
+	account, kind, err := s.subscriptionAccounts.UpsertSubscriptionAccount(ctx, CreateSubscriptionAccountParams{
 		Owner: params.Owner, Provider: params.Provider,
-		ExternalAccountID: params.ExternalAccountID, RefreshToken: ciphertext,
+		ExternalAccountID: params.ExternalAccountID,
+		DisplayName:       normalizeSubscriptionAccountDisplayName(params.DisplayName),
+		RefreshToken:      ciphertext,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if kind.FirstConnected() && s.onboarding != nil {
+		s.onboarding.SubscriptionConnected(SubscriptionConnectedEvent{
+			InstallationExternalID: params.InstallationExternalID,
+			CredentialSubjectID:    params.Owner.SubscriberID,
+			APIKeyID:               params.Owner.APIKeyID,
+			AccountID:              account.ID,
+			Provider:               account.Provider,
+			OccurredAt:             s.now(),
+		})
+	}
+	return account, nil
+}
+
+func normalizeSubscriptionAccountDisplayName(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, value)
+	value = strings.Join(strings.Fields(value), " ")
+	if utf8.RuneCountInString(value) > 512 {
+		value = string([]rune(value)[:512])
+	}
+	return value
 }
 
 // UpdateSubscriptionAccountCooldown records quota state without changing the
@@ -342,6 +414,7 @@ func (s *Service) LoadSubscriptionCredentials(ctx context.Context, owner Subscri
 		TokenRefreshVersion: credentialRecord.TokenRefreshVersion,
 		TokenRefreshLeaseID: credentialRecord.TokenRefreshLeaseID,
 		Enabled:             credentialRecord.Enabled,
+		State:               credentialRecord.State,
 		CooldownUntil:       credentialRecord.CooldownUntil,
 	}
 	if len(credentialRecord.AccessTokenCiphertext) > 0 {
@@ -392,6 +465,19 @@ func (s *Service) UpdateSubscriptionAccountState(ctx context.Context, owner Subs
 	}
 	rowsErr := s.subscriptionAccounts.UpdateSubscriptionAccountState(ctx, accountID, owner, enabled, cooldownUntil)
 	return rowsErr
+}
+
+// UpdateSubscriptionAccountHealth records a routing health transition.
+func (s *Service) UpdateSubscriptionAccountHealth(ctx context.Context, owner SubscriptionOwner, accountID string, state SubscriptionAccountState, enabled bool, cooldownUntil *time.Time) error {
+	if s.subscriptionAccounts == nil {
+		return errors.New("subscription accounts are not configured")
+	}
+	if repository, ok := s.subscriptionAccounts.(interface {
+		UpdateSubscriptionAccountHealth(context.Context, string, SubscriptionOwner, SubscriptionAccountState, bool, *time.Time) error
+	}); ok {
+		return repository.UpdateSubscriptionAccountHealth(ctx, accountID, owner, state, enabled, cooldownUntil)
+	}
+	return s.subscriptionAccounts.UpdateSubscriptionAccountState(ctx, accountID, owner, enabled, cooldownUntil)
 }
 
 // DeleteSubscriptionAccount removes an account only for the authenticated owner.

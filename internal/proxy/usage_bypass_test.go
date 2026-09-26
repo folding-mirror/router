@@ -559,7 +559,7 @@ func TestSubscriptionOnly_ServesOnSubscription_EvenAboveThreshold(t *testing.T) 
 		WithSubscriptionAwareRouting(obs, 0.05, 2.0)
 
 	rec, req, body := bypassRequest(t)
-	ctx := billing.WithSubscriptionOnly(bypassCtx(0.80))
+	ctx := billing.WithSubscriptionOnly(bypassCtx(0.80), billing.SubscriptionOnlyCreditsDepleted)
 	require.NoError(t, svc.ProxyMessages(ctx, body, rec, req))
 
 	assert.Equal(t, 0, fr.routeCalls, "subscription-only mode must keep the bypass engaged, not run the scorer")
@@ -567,6 +567,19 @@ func TestSubscriptionOnly_ServesOnSubscription_EvenAboveThreshold(t *testing.T) 
 	assert.Contains(t, string(p.proxyBodies[0]), `"`+bypassRequestedMdl+`"`, "bypass must preserve the caller-requested model")
 	assert.Contains(t, rec.Body.String(), "credits are depleted", "the customer must see the depleted-credits warning")
 	assert.Contains(t, rec.Body.String(), "weave-router", "the warning must surface the top-up CTA")
+}
+
+func TestSubscriptionOnlyWarning_RespectsRoutingMarkerOptOut(t *testing.T) {
+	fr := &fakeRouter{decision: router.Decision{Provider: providers.ProviderAnthropic, Model: bypassScorerPickMdl}}
+	p := &fakeProvider{proxyResponse: bypassStreamResponse}
+	svc := proxy.NewService(fr, map[string]providers.Client{providers.ProviderAnthropic: p}, nil, false, nil, nil, false, providers.ProviderAnthropic, bypassScorerPickMdl, nil)
+
+	rec, req, body := bypassRequest(t)
+	req.Header.Set("X-Weave-Routing-Marker", "off")
+	ctx := billing.WithSubscriptionOnly(bypassCtx(0.80), billing.SubscriptionOnlyCreditsDepleted)
+	require.NoError(t, svc.ProxyMessages(ctx, body, rec, req))
+
+	assert.NotContains(t, rec.Body.String(), "credits are depleted", "the routing-marker opt-out must also suppress the depletion warning")
 }
 
 // TestSubscriptionOnly_ExhaustedSubscription_Refuses402: in subscription-only
@@ -585,7 +598,7 @@ func TestSubscriptionOnly_ExhaustedSubscription_Refuses402(t *testing.T) {
 		WithSubscriptionAwareRouting(obs, 0.05, 2.0)
 
 	rec, req, body := bypassRequest(t)
-	ctx := billing.WithSubscriptionOnly(bypassCtx(0.80))
+	ctx := billing.WithSubscriptionOnly(bypassCtx(0.80), billing.SubscriptionOnlyCreditsDepleted)
 	err := svc.ProxyMessages(ctx, body, rec, req)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, proxy.ErrCreditsExhaustedSubscriptionUnavailable),
@@ -611,7 +624,8 @@ func TestSubscriptionOnly_NonBypassServedOnSub_Serves(t *testing.T) {
 	// engages; the caller still presents a Claude OAuth subscription and the
 	// scorer routes to Anthropic, so the turn serves on that subscription.
 	ctx := billing.WithSubscriptionOnly(
-		context.WithValue(context.Background(), proxy.AnthropicSubscriptionContextKey{}, bypassSubToken))
+		context.WithValue(context.Background(), proxy.AnthropicSubscriptionContextKey{}, bypassSubToken),
+		billing.SubscriptionOnlyCreditsDepleted)
 	require.NoError(t, svc.ProxyMessages(ctx, body, rec, req))
 
 	assert.Positive(t, fr.routeCalls, "a non-bypass turn runs the scorer")
@@ -639,7 +653,8 @@ func TestSubscriptionOnly_NonBypassPaidRoute_Refuses402(t *testing.T) {
 	rec, req, body := bypassRequest(t)
 	// Sub present but the scorer routes to a paid provider it can't cover.
 	ctx := billing.WithSubscriptionOnly(
-		context.WithValue(context.Background(), proxy.AnthropicSubscriptionContextKey{}, bypassSubToken))
+		context.WithValue(context.Background(), proxy.AnthropicSubscriptionContextKey{}, bypassSubToken),
+		billing.SubscriptionOnlyCreditsDepleted)
 	err := svc.ProxyMessages(ctx, body, rec, req)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, proxy.ErrCreditsExhaustedSubscriptionUnavailable),
@@ -673,7 +688,7 @@ func TestSubscriptionOnly_BypassRetryable_Refuses402(t *testing.T) {
 		WithSubscriptionAwareRouting(obs, 0.05, 2.0)
 
 	rec, req, body := bypassRequest(t)
-	ctx := billing.WithSubscriptionOnly(bypassCtx(0.80))
+	ctx := billing.WithSubscriptionOnly(bypassCtx(0.80), billing.SubscriptionOnlyCreditsDepleted)
 	err := svc.ProxyMessages(ctx, body, rec, req)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, proxy.ErrCreditsExhaustedSubscriptionUnavailable),

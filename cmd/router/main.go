@@ -77,6 +77,18 @@ import (
 
 func main() {
 	logger := observability.Get()
+	egressProbe, err := newStartupEgressProbe(config.GetOr("ROUTER_STARTUP_EGRESS_ORIGINS", ""))
+	if err != nil {
+		logger.Error("Invalid startup egress configuration; refusing to boot", "err", err)
+		panic(err)
+	}
+	egressCtx, stopEgress := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	err = egressProbe.wait(egressCtx, logger)
+	stopEgress()
+	if err != nil {
+		logger.Error("Startup outbound connectivity failed; refusing to boot", "err", err)
+		panic(err)
+	}
 	// Initialize propagation and APM before constructing HTTP clients so their
 	// OpenTelemetry transports capture the configured providers and propagator.
 	apm.Init()
@@ -315,6 +327,18 @@ func main() {
 	}
 
 	{
+		// DeepInfra is the primary OSS serving surface for the Max candidate
+		// models. It speaks OpenAI Chat Completions and receives the canonical
+		// model IDs from the catalog's UpstreamID bindings.
+		deepInfraBaseURL := config.GetOr("DEEPINFRA_BASE_URL", openaiCompatProvider.DeepInfraBaseURL)
+		registerDeploymentKeyedProvider(providerMap, envKeyedProviders, logger,
+			providers.ProviderDeepInfra, "DeepInfra", "DEEPINFRA_API_KEY", deepInfraBaseURL, byokOnly,
+			func(key, baseURL string) providers.Client {
+				return openaiCompatProvider.NewClientWithModelIDMap(key, baseURL, upstreamIDsForProvider(providers.ProviderDeepInfra), openaiCompatProvider.WithModelListHTTPClient(discoveryHTTPClient))
+			})
+	}
+
+	{
 		// Makora uses provider-canonical model IDs vs. the router's slash-form
 		// slugs; modelIDMap comes from the catalog's per-binding UpstreamID.
 		makoraBaseURL := config.GetOr("MAKORA_BASE_URL", openaiCompatProvider.MakoraBaseURL)
@@ -543,7 +567,8 @@ func main() {
 		WithBlindExperiments(repo.BlindExperiments, blindExperimentCache).
 		WithWIFTokenSource(buildWIFTokenSource(logger)).
 		WithEntraTokenSource(buildEntraTokenSource(logger)).
-		WithFlagOverridesDisabled(flagOverridesDisabled)
+		WithFlagOverridesDisabled(flagOverridesDisabled).
+		WithRequestIdentities(repo.RequestIdentities)
 	subscriptionPoolsEnabled := config.GetOr("ROUTER_SUBSCRIPTION_POOLS_ENABLED", "false") == "true"
 	var subscriptionRuntime *subscriptions.Runtime
 	if subscriptionPoolsEnabled {
@@ -618,6 +643,7 @@ func main() {
 	var telemetryEmitter proxy.TelemetryEmitter
 	if emitter != nil {
 		telemetryEmitter = emitter
+		authSvc.WithOnboardingObserver(otel.NewOnboardingObserver(emitter))
 	}
 
 	semanticCache := buildSemanticCache(rtr)
@@ -1309,6 +1335,10 @@ func main() {
 		WithDefaultBaselineModel(resolveDefaultBaselineModel()).
 		WithBillingService(billingSvc)
 	inferenceDeployment.RoutableModels = servedModels
+	if err := configureAtomicClassifier(proxySvc, pool, availableProviders); err != nil {
+		logger.Error("Failed to configure atomic classifier", "err", err)
+		panic(err)
+	}
 	proxySvc = proxySvc.WithInferenceExecutor(inferenceExecutor).WithInferencePlans(inferencePlans).WithInferenceDeployment(inferenceDeployment)
 	if subscriptionRuntime != nil {
 		proxySvc.WithManagedSubscriptions(subscriptionRuntime)
@@ -1443,12 +1473,8 @@ func main() {
 			postgres.NewSubscriberEntitlementRepo(pool),
 			postgres.NewSubscriberAllowanceRepo(pool),
 		)
-		// The subscriber's own prepaid book is bound alongside the allowance:
-		// both belong to the credential subject, so an individual plan can
-		// never resolve to the organization's balance.
 		billingSvc = billingSvc.
-			WithSubscriberAllowance(subscriberAllowanceSvc).
-			WithSubscriberPrepaid(postgres.NewSubscriberCreditRepo(pool))
+			WithSubscriberAllowance(subscriberAllowanceSvc)
 		logger.Info("Individual subscriber allowance enforcement enabled")
 	}
 	server.RegisterWithFeatures(engine, authSvc, proxySvc, deployedModels, hmmRosterModels, deploymentMode, billingSvc, readinessChecker, hmmRosterSources, analyticsSvc, server.Features{PolicyPinEnabled: policyPinEnabled, ServingAdmission: servingAdmission, SubscriberAllowance: subscriberAllowanceSvc})

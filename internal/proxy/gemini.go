@@ -37,6 +37,10 @@ var ErrGeminiCrossFormatUnsupported = errors.New("gemini cross-format emit not i
 // and "stream" (true for :streamGenerateContent) fields into body before
 // calling; both are stripped before forwarding upstream.
 func (s *Service) ProxyGeminiGenerateContent(ctx context.Context, body []byte, w http.ResponseWriter, r *http.Request) (returnErr error) {
+	ctx, returnErr = s.withClassifierInput(ctx, body, router.EndpointGeminiGenerate)
+	if returnErr != nil {
+		return returnErr
+	}
 	if managedSubscriptionEnrollmentUnavailable(ctx) {
 		return ErrSubscriptionPoolUnavailable
 	}
@@ -67,6 +71,11 @@ func (s *Service) ProxyGeminiGenerateContent(ctx context.Context, body []byte, w
 	// cleanup — matching the OpenAI chat path's feedback-footer strip.
 	if strippedBody, stripErr := translate.StripFeedbackFooterFromGeminiContents(body); stripErr != nil {
 		log.Error("Failed to strip feedback footer from Gemini contents", "err", stripErr)
+	} else {
+		body = strippedBody
+	}
+	if strippedBody, stripErr := translate.StripRoutingMarkerFromGeminiContents(body); stripErr != nil {
+		log.Error("Failed to strip routing marker from Gemini contents", "err", stripErr)
 	} else {
 		body = strippedBody
 	}
@@ -304,7 +313,7 @@ func (s *Service) ProxyGeminiGenerateContent(ctx context.Context, body []byte, w
 	contentSink, contentCap := s.maybeCaptureResponse(ctx, clientSink)
 	// preludeBuf delays commit so a 429 or empty stream stays retryable.
 	preludeBuf := newPreludeBuffer(contentSink)
-	marker := suppressMarkerIfRequested(ctx, r.Header, routingMarkerFor(routeRes))
+	marker := suppressMarkerIfRequested(ctx, r.Header, modelSelectionMarkerForRequest(ctx, routeRes, routingMarkerFor(routeRes), decision.Model, ""))
 	bindings := s.resolveBindingsForDispatch(ctx, decision)
 	attempt := func(actx context.Context, d router.Decision, p providers.Client) error {
 		attemptSink := http.ResponseWriter(preludeBuf)
@@ -403,6 +412,7 @@ func (s *Service) ProxyGeminiGenerateContent(ctx context.Context, body []byte, w
 	// has cache-hit and output-limit evidence.
 	s.recordTurnUsage(ctx, routeRes, finalProvider, decision.ServedIdentity(), in, out, cacheCreation, cacheRead, extractor.OutputLimitReached())
 
+	var subscriberTelemetry *InsertTelemetryParams
 	if installationID != uuid.Nil {
 		credentialKeyPrefix, credentialKeySuffix, credentialSource := s.credentialKeyParts(ctx)
 		telemetryParams := InsertTelemetryParams{
@@ -471,16 +481,26 @@ func (s *Service) ProxyGeminiGenerateContent(ctx context.Context, body []byte, w
 		applyPlannerTelemetry(&telemetryParams, routeRes)
 		applyEffortTelemetry(&telemetryParams, effortServed)
 		applyAuthorityShadowTelemetry(&telemetryParams, routeRes)
-		applyBlindExperimentTelemetry(ctx, &telemetryParams)
+		applyBlindExperimentTelemetry(ctx, &telemetryParams, &routeRes)
 		applyPolicyPinTelemetry(ctx, &telemetryParams, decision.Metadata)
-		s.fireTelemetry(telemetryParams)
+		applySubscriberTelemetry(ctx, &telemetryParams)
+		subscriberTelemetry = &telemetryParams
 	}
 
+	var subscriberSettlement subscriberSettlementState
 	if proxyErr == nil {
-		s.emitBilling(ctx, requestID, externalID, feats.Model, decision, actPricing, routeRes, in, out, cacheCreation, cacheRead)
+		subscriberSettlement = s.emitBilling(ctx, requestID, externalID, feats.Model, decision, actPricing, routeRes, in, out, cacheCreation, cacheRead)
 		if compRes.Summarized {
 			s.billCompactionSummary(ctx, requestID, externalID, compRes.SummaryUsage)
 		}
+	}
+	if subscriberTelemetry != nil {
+		if proxyErr == nil {
+			applySubscriberSettlementTelemetry(subscriberSettlement, subscriberTelemetry)
+		} else {
+			markSubscriberTelemetryUnsettled(subscriberTelemetry)
+		}
+		s.fireTelemetry(*subscriberTelemetry)
 	}
 
 	// Two-strike provider disable: see ProxyMessages. Gemini rarely produces a

@@ -3,7 +3,9 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 
 	"weave-os/router/internal/auth"
 	"weave-os/router/internal/flags"
@@ -24,10 +26,13 @@ type Repository struct {
 	UserClusterModelLists auth.UserClusterModelListRepository
 	BlindExperiments      auth.BlindExperimentRepository
 	SubscriptionAccounts  auth.SubscriptionAccountRepository
-	Telemetry             *TelemetryRepo
-	Feedback              *FeedbackRepo
-	Analytics             *AnalyticsRepo
-	FlagDefinitions       *FlagDefinitionRepo
+	// RequestIdentities resolves the caller behind a request email, which a
+	// shared routing key cannot identify on its own.
+	RequestIdentities auth.RequestIdentityRepository
+	Telemetry         *TelemetryRepo
+	Feedback          *FeedbackRepo
+	Analytics         *AnalyticsRepo
+	FlagDefinitions   *FlagDefinitionRepo
 	// GlobalAutomaticExclusions is deployment-scoped rather than
 	// installation-scoped: it is the control plane's list of models withdrawn
 	// from automatic routing for every tenant.
@@ -45,6 +50,7 @@ func NewRepository(tx sqlc.DBTX, encryptor auth.Encryptor) *Repository {
 		UserClusterModelLists:     NewUserClusterModelListRepo(tx),
 		BlindExperiments:          NewBlindExperimentRepo(tx),
 		SubscriptionAccounts:      NewSubscriptionAccountRepo(tx),
+		RequestIdentities:         NewRequestIdentityRepo(tx),
 		Telemetry:                 NewTelemetryRepo(tx),
 		Feedback:                  NewFeedbackRepo(tx),
 		Analytics:                 NewAnalyticsRepo(tx),
@@ -313,6 +319,23 @@ func (r *installationRepo) UpdateHideTerminalSurfaces(ctx context.Context, exter
 	return nil
 }
 
+func (r *installationRepo) UpdateShowModelSelectionReasoning(ctx context.Context, externalID, id string, show bool) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	rows, err := sqlc.New(r.tx).UpdateModelRouterInstallationShowModelSelectionReasoning(ctx, sqlc.UpdateModelRouterInstallationShowModelSelectionReasoningParams{
+		ID: parsed, ExternalID: externalID, ShowModelSelectionReasoning: show,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return auth.ErrInstallationNotFound
+	}
+	return nil
+}
+
 // UpdateFlagOverrides writes the whole sparse override set. Callers pass the
 // post-modification set (read-modify-write), so an override is cleared by
 // omitting its key rather than by writing a sentinel value.
@@ -392,13 +415,16 @@ func (r *apiKeyRepo) ListForInstallation(ctx context.Context, installationID str
 	return out, nil
 }
 
-func (r *apiKeyRepo) MarkUsed(ctx context.Context, id string) error {
+func (r *apiKeyRepo) MarkUsed(ctx context.Context, id string) (bool, error) {
 	parsed, err := uuid.Parse(id)
 	if err != nil {
-		return err
+		return false, err
 	}
-	q := sqlc.New(r.tx)
-	return q.MarkModelRouterAPIKeyUsed(ctx, parsed)
+	firstUse, err := sqlc.New(r.tx).MarkModelRouterAPIKeyUsed(ctx, parsed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return firstUse, err
 }
 
 func (r *apiKeyRepo) SoftDelete(ctx context.Context, installationID, id string) (int64, error) {

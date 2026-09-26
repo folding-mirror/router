@@ -29,6 +29,7 @@ type fakeAPIKeyRepository struct {
 
 	// markUsedPanic, when true, causes MarkUsed to panic so fireMarkUsed recovery can be exercised.
 	markUsedPanic bool
+	markUsedErr   error
 
 	mu       sync.Mutex
 	markUsed []string
@@ -79,14 +80,25 @@ func (f *fakeAPIKeyRepository) ListForInstallation(ctx context.Context, installa
 	return nil, errors.New("not used by these tests")
 }
 
-func (f *fakeAPIKeyRepository) MarkUsed(ctx context.Context, id string) error {
+func (f *fakeAPIKeyRepository) MarkUsed(ctx context.Context, id string) (bool, error) {
 	if f.markUsedPanic {
 		panic("boom: mark used")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.markUsedErr != nil {
+		f.markUsed = append(f.markUsed, id)
+		return false, f.markUsedErr
+	}
+	firstUse := true
+	for _, seen := range f.markUsed {
+		if seen == id {
+			firstUse = false
+			break
+		}
+	}
 	f.markUsed = append(f.markUsed, id)
-	return nil
+	return firstUse, nil
 }
 
 func (f *fakeAPIKeyRepository) SoftDelete(ctx context.Context, installationID, id string) (int64, error) {
@@ -130,9 +142,7 @@ func (f *fakeExternalAPIKeyRepo) UpdateModelAliases(ctx context.Context, install
 	return nil, f.err
 }
 
-func (f *fakeExternalAPIKeyRepo) MarkUsed(ctx context.Context, id string) error {
-	return nil
-}
+func (f *fakeExternalAPIKeyRepo) MarkUsed(ctx context.Context, id string) error { return nil }
 
 type fakeInstallationRepository struct {
 	excludedModelsByID              map[string][]string
@@ -147,6 +157,7 @@ type fakeInstallationRepository struct {
 	subscriptionRoutingDisabledByID map[string]bool
 	contentCaptureModeByID          map[string]*string
 	hideTerminalSurfacesByID        map[string]bool
+	showModelSelectionReasoningByID map[string]bool
 	flagOverridesByID               map[string]flags.Overrides
 	fastModeModelsByID              map[string][]string
 	// firstRequestServedIDs counts MarkFirstRequestServed calls per installation.
@@ -286,6 +297,16 @@ func (f *fakeInstallationRepository) UpdateHideTerminalSurfaces(ctx context.Cont
 		f.hideTerminalSurfacesByID = map[string]bool{}
 	}
 	f.hideTerminalSurfacesByID[id] = hide
+	return nil
+}
+func (f *fakeInstallationRepository) UpdateShowModelSelectionReasoning(ctx context.Context, externalID, id string, show bool) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	if f.showModelSelectionReasoningByID == nil {
+		f.showModelSelectionReasoningByID = map[string]bool{}
+	}
+	f.showModelSelectionReasoningByID[id] = show
 	return nil
 }
 func (f *fakeInstallationRepository) UpdateUsageBypass(ctx context.Context, externalID, id string, enabled bool, threshold *float64) error {
@@ -1190,6 +1211,14 @@ func TestService_WriteHooksInvalidateAndNotify(t *testing.T) {
 			"routing-preference writes must drop the cached installation so the next request sees the new dial")
 		assert.Equal(t, []string{installID}, nf.snapshot(),
 			"routing-preference writes must publish NOTIFY so peer replicas drop their cache too")
+	})
+
+	t.Run("SetInstallationShowModelSelectionReasoning", func(t *testing.T) {
+		svc, cache, nf := makeSvc()
+		err := svc.SetInstallationShowModelSelectionReasoning(context.Background(), "ext-1", installID, true)
+		require.NoError(t, err)
+		assert.Equal(t, []string{installID}, cache.invalidationSnapshot())
+		assert.Equal(t, []string{installID}, nf.snapshot())
 	})
 
 	t.Run("UpsertExternalAPIKey", func(t *testing.T) {

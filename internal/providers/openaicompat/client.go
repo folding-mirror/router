@@ -24,6 +24,8 @@ import (
 const (
 	DefaultBaseURL   = "https://openrouter.ai/api/v1"
 	FireworksBaseURL = "https://api.fireworks.ai/inference/v1"
+	// DeepInfraBaseURL serves OpenAI-compatible inference for the OSS catalog.
+	DeepInfraBaseURL = "https://api.deepinfra.com/v1/openai"
 	// MakoraBaseURL serves the OSS catalog at higher throughput than commodity
 	// providers; pair with NewClientWithModelIDMap to rewrite slugs to Makora's
 	// upstream IDs.
@@ -160,6 +162,12 @@ func newClient(apiKey, baseURL string, modelIDMap map[string]string, opts ...Opt
 		opt(client)
 	}
 	return client
+}
+
+// DeploymentPrincipal fingerprints the account this client's own key
+// authenticates as; see providers.DeploymentPrincipal.
+func (c *Client) DeploymentPrincipal() string {
+	return providers.CredentialPrincipal(c.baseURL, c.apiKey)
 }
 
 // httpFor picks the HTTP client for a routed model: Grok models get the

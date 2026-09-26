@@ -430,7 +430,10 @@ strip_codex_block() {
       in_weave_provider = 0
     }
     in_weave_provider { next }
+    !in_section && /^[[:space:]]*#[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave".*weave-router: off/ { next }
+    !in_section && /^[[:space:]]*#[[:space:]]*model[[:space:]]*=[[:space:]]*"weave-auto".*weave-router: off/ { next }
     !in_section && /^[[:space:]]*model_provider[[:space:]]*=[[:space:]]*"weave"[[:space:]]*$/ { next }
+    !in_section && /^[[:space:]]*model[[:space:]]*=[[:space:]]*"weave-auto"[[:space:]]*$/ { next }
     { print }
   ' "$config_file" >"$tmp"
   mv "$tmp" "$config_file"
@@ -546,6 +549,11 @@ if [ "$target" = "opencode" ]; then
     if [ -f "$opencode_directives" ]; then
       refuse_if_symlink "$opencode_directives"
       rm -f "$opencode_directives"
+    fi
+    opencode_classifier="$(dirname "$opencode_plugin")/classifier-thread.ts"
+    if [ -f "$opencode_classifier" ]; then
+      refuse_if_symlink "$opencode_classifier"
+      rm -f "$opencode_classifier"
     fi
     rmdir "$opencode_dir/.weave" 2>/dev/null || true
     ok "Removed $opencode_plugin"

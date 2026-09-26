@@ -4,7 +4,7 @@
 -- cluster_router_version, ttft_ms, cache_*_tokens, device_id, session_id) are
 -- nullable; non-cluster decisions and pinned-route turns leave them NULL.
 -- turn_type is the turntype classification (main_loop, tool_result, probe,
--- title_gen, compaction, classifier, sub_agent_dispatch); NULL only on rows
+-- title_gen, compaction, classifier, recap, sub_agent_dispatch); NULL only on rows
 -- written before the column existed.
 -- rollout_id is the client-supplied x-weave-rollout-id correlation id used by
 -- eval/training harnesses to join graded rollout rewards onto decisions; NULL
@@ -107,6 +107,13 @@ INSERT INTO router.model_router_request_telemetry (
     blind_experiment_arm,
     blind_experiment_assignment_source,
     blind_experiment_subject_key,
+    cohort_experiment_id,
+    cohort_group_id,
+    cohort_phase_index,
+    cohort_revision,
+    cohort_scheduled_arm,
+    cohort_treatment_applied,
+    cohort_bypass_reason,
     turn_type,
     rollout_id,
     upstream_finish_reason,
@@ -182,7 +189,20 @@ INSERT INTO router.model_router_request_telemetry (
     effort_arm,
     effort_selected,
     effort_sent,
-    effort_source
+    effort_source,
+    subscriber_plan,
+    entitlement_version,
+    capacity_source,
+    retail_usage_usd_micros,
+    included_usage_usd_micros,
+    linked_usage_usd_micros,
+    prepaid_usage_usd_micros,
+    settlement_failed,
+    serving_profile_id,
+    serving_profile_version,
+    serving_release_id,
+    serving_binding_id,
+    boost_optimizer_version
 ) VALUES (
     @installation_id::uuid,
     sqlc.narg('api_key_id')::uuid,
@@ -245,6 +265,13 @@ INSERT INTO router.model_router_request_telemetry (
     sqlc.narg('blind_experiment_arm')::varchar,
     sqlc.narg('blind_experiment_assignment_source')::varchar,
     sqlc.narg('blind_experiment_subject_key')::varchar,
+    sqlc.narg('cohort_experiment_id')::uuid,
+    sqlc.narg('cohort_group_id')::smallint,
+    sqlc.narg('cohort_phase_index')::smallint,
+    sqlc.narg('cohort_revision')::integer,
+    sqlc.narg('cohort_scheduled_arm')::varchar,
+    sqlc.narg('cohort_treatment_applied')::boolean,
+    sqlc.narg('cohort_bypass_reason')::varchar,
     @turn_type::varchar,
     sqlc.narg('rollout_id')::varchar,
     sqlc.narg('upstream_finish_reason')::text,
@@ -320,7 +347,20 @@ INSERT INTO router.model_router_request_telemetry (
     sqlc.narg('effort_arm')::varchar,
     sqlc.narg('effort_selected')::varchar,
     sqlc.narg('effort_sent')::varchar,
-    sqlc.narg('effort_source')::varchar
+    sqlc.narg('effort_source')::varchar,
+    sqlc.narg('subscriber_plan')::varchar,
+    sqlc.narg('entitlement_version')::bigint,
+    sqlc.narg('capacity_source')::varchar,
+    sqlc.narg('retail_usage_usd_micros')::bigint,
+    sqlc.narg('included_usage_usd_micros')::bigint,
+    sqlc.narg('linked_usage_usd_micros')::bigint,
+    sqlc.narg('prepaid_usage_usd_micros')::bigint,
+    sqlc.narg('settlement_failed')::boolean,
+    sqlc.narg('serving_profile_id')::varchar,
+    sqlc.narg('serving_profile_version')::varchar,
+    sqlc.narg('serving_release_id')::varchar,
+    sqlc.narg('serving_binding_id')::varchar,
+    sqlc.narg('boost_optimizer_version')::varchar
 )
 ON CONFLICT (installation_id, request_id, span_type) DO NOTHING;
 
@@ -676,8 +716,8 @@ LIMIT 1 OFFSET @turn_offset::int;
 -- so only ingest order can guarantee "resume here and miss nothing".
 -- cursor_created_at / cursor_id are NULL on the first page and carry the last
 -- row of the previous page thereafter. The columns selected are the tier-b
--- export set; scorer internals (cluster_ids, candidate_scores, propensity,
--- alpha_breakdown, policy artifacts) and credential fragments are withheld.
+-- export set; immutable policy and roster identities are included for benchmark
+-- joins, while scorer internals and credential fragments remain withheld.
 -- name: GetRoutingDecisionsForExport :many
 SELECT
     t.id,
@@ -686,6 +726,7 @@ SELECT
     t.request_id,
     t.trace_id,
     t.session_id,
+    t.rollout_id,
     t.device_id,
     t.client_app,
     t.turn_type,
@@ -695,12 +736,23 @@ SELECT
     t.requested_model,
     t.decision_model,
     t.decision_provider,
+    t.route_id,
+    t.strategy,
+    t.policy_route_key,
+    t.cluster_router_version,
     t.candidate_models,
     t.chosen_score,
     t.decision_reason,
     t.blind_experiment_arm,
     t.blind_experiment_assignment_source,
     t.blind_experiment_subject_key,
+    t.cohort_experiment_id,
+    t.cohort_group_id,
+    t.cohort_phase_index,
+    t.cohort_revision,
+    t.cohort_scheduled_arm,
+    t.cohort_treatment_applied,
+    t.cohort_bypass_reason,
     t.policy_pin_requested,
     t.policy_pin_honoured,
     t.sticky_hit,
@@ -728,6 +780,24 @@ SELECT
     t.stop_reason,
     t.tool_use_blocks,
     t.invalid_tool_args_blocks,
+    t.subscriber_plan,
+    t.entitlement_version,
+    t.capacity_source,
+    t.retail_usage_usd_micros,
+    t.included_usage_usd_micros,
+    t.linked_usage_usd_micros,
+    t.prepaid_usage_usd_micros,
+    t.settlement_failed,
+    t.serving_profile_id,
+    t.serving_profile_version,
+    t.serving_release_id,
+    t.serving_binding_id,
+    t.boost_optimizer_version,
+    t.policy_artifact_id,
+    t.policy_artifact_sha256,
+    t.roster_version,
+    t.selection_policy_release_id,
+    t.selection_policy_sha256,
     t.client_git_head_sha,
     t.client_git_branch,
     t.client_git_dirty

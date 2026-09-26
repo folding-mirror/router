@@ -45,9 +45,7 @@ func (f *fakeExternalAPIKeyRepository) UpdateModelAliases(context.Context, strin
 	return nil, errors.New("not used")
 }
 
-func (f *fakeExternalAPIKeyRepository) MarkUsed(context.Context, string) error {
-	return nil
-}
+func (f *fakeExternalAPIKeyRepository) MarkUsed(context.Context, string) error { return nil }
 
 type fakeAPIKeyRepository struct {
 	byHash map[string]fakeKeyRow
@@ -82,11 +80,11 @@ func (f *fakeAPIKeyRepository) ListForInstallation(ctx context.Context, installa
 	return nil, errors.New("not used")
 }
 
-func (f *fakeAPIKeyRepository) MarkUsed(ctx context.Context, id string) error {
+func (f *fakeAPIKeyRepository) MarkUsed(ctx context.Context, id string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.used = append(f.used, id)
-	return nil
+	return true, nil
 }
 
 func (f *fakeAPIKeyRepository) SoftDelete(ctx context.Context, installationID, id string) (int64, error) {
@@ -97,8 +95,8 @@ type fakeInstallationRepository struct{}
 
 type failingSubscriptionAccountRepository struct{ err error }
 
-func (r failingSubscriptionAccountRepository) UpsertSubscriptionAccount(context.Context, auth.CreateSubscriptionAccountParams) (*auth.SubscriptionAccount, error) {
-	return nil, r.err
+func (r failingSubscriptionAccountRepository) UpsertSubscriptionAccount(context.Context, auth.CreateSubscriptionAccountParams) (*auth.SubscriptionAccount, auth.SubscriptionUpsertKind, error) {
+	return nil, auth.SubscriptionUpsertUpdated, r.err
 }
 func (r failingSubscriptionAccountRepository) ListSubscriptionAccounts(context.Context, auth.SubscriptionOwner) ([]*auth.SubscriptionAccount, error) {
 	return nil, r.err
@@ -179,6 +177,10 @@ func (fakeInstallationRepository) UpdateSubscriptionRoutingDisabled(ctx context.
 func (fakeInstallationRepository) UpdateContentCaptureMode(ctx context.Context, externalID, id string, mode *string) error {
 	return errors.New("not used")
 }
+
+func (fakeInstallationRepository) UpdateShowModelSelectionReasoning(context.Context, string, string, bool) error {
+	return errors.New("not used")
+}
 func (fakeInstallationRepository) UpdateHideTerminalSurfaces(ctx context.Context, externalID, id string, hide bool) error {
 	return errors.New("not used")
 }
@@ -196,6 +198,7 @@ func TestWithAuthPrefersRouterKeyHeader(t *testing.T) {
 		ID: "inst-1", ExternalID: "ext-1", RoutingRolloutID: "rollout-1",
 		PolicyShadowStrategy: "future-policy", PolicyDebugEnabled: true,
 		PolicyRoutingIntent: "high", AITrainingAllowed: true,
+		ShowModelSelectionReasoning: true,
 	}
 	repo := &fakeAPIKeyRepository{byHash: map[string]fakeKeyRow{
 		hash: {apiKey: apiKey, installation: installation},
@@ -215,6 +218,7 @@ func TestWithAuthPrefersRouterKeyHeader(t *testing.T) {
 		assert.Equal(t, true, ctx.Value(proxy.PolicyDebugEnabledContextKey{}))
 		assert.Equal(t, "high", ctx.Value(proxy.PolicyRoutingIntentContextKey{}))
 		assert.Equal(t, true, ctx.Value(proxy.PolicyTrainingAllowedContextKey{}))
+		assert.Equal(t, true, ctx.Value(proxy.InstallationShowModelSelectionReasoningContextKey{}))
 		c.Status(http.StatusOK)
 	})
 
